@@ -476,6 +476,37 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    @staticmethod
+    def _berag_debug_enabled(scheduler_output: SchedulerOutput) -> bool:
+        return any(
+            shard.debug for shard in scheduler_output.scheduled_berag_shards or []
+        )
+
+    @staticmethod
+    def _berag_model_output_summary(
+        model_output: ModelRunnerOutput | None,
+    ) -> str:
+        if model_output is None:
+            return "None"
+        return (
+            f"{type(model_output).__name__}("
+            f"req_ids={model_output.req_ids}, "
+            f"sampled_token_ids={model_output.sampled_token_ids}, "
+            f"berag_outputs={len(model_output.berag_outputs or [])}, "
+            f"row_pool={model_output.berag_row_pool})"
+        )
+
+    @classmethod
+    def _berag_debug_engine(
+        cls,
+        scheduler_output: SchedulerOutput,
+        message: str,
+        *args: Any,
+    ) -> None:
+        if not cls._berag_debug_enabled(scheduler_output):
+            return
+        logger.info("[BERAG debug] engine " + message, *args)
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -488,21 +519,47 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        self._berag_debug_engine(
+            scheduler_output,
+            "scheduled tokens=%d reqs=%s shards=%d",
+            scheduler_output.total_num_scheduled_tokens,
+            list(scheduler_output.num_scheduled_tokens),
+            len(scheduler_output.scheduled_berag_shards or []),
+        )
+        self._berag_debug_engine(scheduler_output, "submit execute_model")
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            self._berag_debug_engine(scheduler_output, "wait execute_model future")
             model_output = future.result()
+            self._berag_debug_engine(
+                scheduler_output,
+                "execute_model returned %s",
+                self._berag_model_output_summary(model_output),
+            )
             if model_output is None:
+                self._berag_debug_engine(scheduler_output, "call sample_tokens")
                 model_output = self.model_executor.sample_tokens(grammar_output)
+                self._berag_debug_engine(
+                    scheduler_output,
+                    "sample_tokens returned %s",
+                    self._berag_model_output_summary(model_output),
+                )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        self._berag_debug_engine(scheduler_output, "call scheduler.update_from_output")
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        self._berag_debug_engine(
+            scheduler_output,
+            "scheduler.update_from_output returned clients=%s",
+            list(engine_core_outputs),
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -545,7 +602,18 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            self._berag_debug_engine(
+                scheduler_output,
+                "batch_queue scheduled tokens=%d reqs=%s shards=%d",
+                scheduler_output.total_num_scheduled_tokens,
+                list(scheduler_output.num_scheduled_tokens),
+                len(scheduler_output.scheduled_berag_shards or []),
+            )
             with self.log_error_detail(scheduler_output):
+                self._berag_debug_engine(
+                    scheduler_output,
+                    "batch_queue submit execute_model",
+                )
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
@@ -561,6 +629,10 @@ class EngineCore:
                     # and sample immediately.
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
+                    )
+                    self._berag_debug_engine(
+                        scheduler_output,
+                        "batch_queue submit sample_tokens",
                     )
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
@@ -588,11 +660,17 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        self._berag_debug_engine(scheduler_output, "batch_queue wait future")
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
+            self._berag_debug_engine(
+                scheduler_output,
+                "batch_queue future returned %s",
+                self._berag_model_output_summary(model_output),
+            )
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -602,8 +680,17 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        self._berag_debug_engine(
+            scheduler_output,
+            "batch_queue call scheduler.update_from_output",
+        )
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        self._berag_debug_engine(
+            scheduler_output,
+            "batch_queue scheduler.update_from_output returned clients=%s",
+            list(engine_core_outputs),
         )
 
         # NOTE(nick): We can either handle the deferred tasks here or save

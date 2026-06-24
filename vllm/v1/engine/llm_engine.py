@@ -11,6 +11,7 @@ import torch.nn as nn
 from typing_extensions import TypeVar
 
 import vllm.envs as envs
+from vllm.berag import BeragChildMetadata, BeragParams
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.distributed.parallel_state import get_dp_group
@@ -23,6 +24,7 @@ from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
 from vllm.renderers.inputs.preprocess import extract_prompt_components
+from vllm.sampling_params import RequestOutputKind
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike
@@ -137,6 +139,9 @@ class LLMEngine:
             # existing DP group used for data communication.
             self.dp_group = get_dp_group().cpu_group
 
+        self._berag_mode_active = False
+        self._berag_child_ids_by_parent_id: dict[str, list[str]] = {}
+
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
 
@@ -213,7 +218,17 @@ class LLMEngine:
         """Remove request_ids from EngineCore and Detokenizer."""
 
         request_ids = self.output_processor.abort_requests(request_ids, internal)
+        request_ids = self._expand_berag_abort_request_ids(request_ids)
         self.engine_core.abort_requests(request_ids)
+
+    def _expand_berag_abort_request_ids(self, request_ids: list[str]) -> list[str]:
+        expanded_request_ids: list[str] = []
+        for request_id in request_ids:
+            expanded_request_ids.append(request_id)
+            expanded_request_ids.extend(
+                self._berag_child_ids_by_parent_id.pop(request_id, [])
+            )
+        return expanded_request_ids
 
     def add_request(
         self,
@@ -227,6 +242,9 @@ class LLMEngine:
         priority: int = 0,
         prompt_text: str | None = None,
     ) -> str:
+        if self._berag_mode_active:
+            raise ValueError("Ordinary requests are not supported in BERAG mode.")
+
         # Validate the request_id type.
         if not isinstance(request_id, str):
             raise TypeError(f"request_id must be a string, got {type(request_id)}")
@@ -293,6 +311,203 @@ class LLMEngine:
 
         return req_id
 
+    def add_berag_request(
+        self,
+        request_id: str,
+        shared_prefix: str,
+        documents: list[str],
+        suffix: str,
+        sampling_params: SamplingParams,
+        berag_params: BeragParams | None = None,
+        arrival_time: float | None = None,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        debug: bool = False,
+    ) -> str:
+        berag_params = berag_params or BeragParams()
+        self._validate_berag_request(documents, sampling_params, berag_params)
+        explicit_prior_indices = berag_params.prior_token_indices
+        if explicit_prior_indices is not None and len(explicit_prior_indices) != len(
+            documents
+        ):
+            raise ValueError(
+                "BeragParams.prior_token_indices must have one entry per document."
+            )
+
+        mode_was_active = self._berag_mode_active
+        self._berag_mode_active = True
+        parent_params = copy(sampling_params)
+        parent_params.output_kind = RequestOutputKind.FINAL_ONLY
+        parent_prompt = f"{shared_prefix}{suffix}"
+
+        child_request_ids: list[str] = []
+        parent_id: str | None = None
+        try:
+            parent_req = self.input_processor.process_inputs(
+                request_id,
+                parent_prompt,
+                parent_params,
+                supported_tasks=self.get_supported_tasks(),
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+            )
+            self.input_processor.assign_request_id(parent_req)
+            parent_id = parent_req.request_id
+            parent_prompt_text, _, _ = extract_prompt_components(
+                self.model_config, parent_prompt
+            )
+            self.output_processor.add_request(parent_req, parent_prompt_text, None, 0)
+            parent_prompt_len = len(parent_req.prompt_token_ids or [])
+            if debug:
+                logger.info(
+                    "[BERAG debug] admission parent=%s external=%s branches=%d "
+                    "parent_prompt_len=%d max_tokens=%s pruning_top_p=%s",
+                    parent_id,
+                    parent_req.external_req_id,
+                    len(documents),
+                    parent_prompt_len,
+                    sampling_params.max_tokens,
+                    berag_params.pruning_top_p,
+                )
+
+            for branch_id, document in enumerate(documents):
+                child_prompt = f"{shared_prefix}{document}{suffix}"
+                child_params = copy(sampling_params)
+                child_params.n = 1
+                child_params.output_kind = RequestOutputKind.FINAL_ONLY
+                child_req_id = f"{parent_id}:berag:{branch_id}"
+                child_req = self.input_processor.process_inputs(
+                    child_req_id,
+                    child_prompt,
+                    child_params,
+                    supported_tasks=self.get_supported_tasks(),
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                    tokenization_kwargs=tokenization_kwargs,
+                    trace_headers=trace_headers,
+                    priority=priority,
+                )
+                assert child_req.prompt_token_ids is not None
+                prior_index = self._resolve_berag_prior_index(
+                    len(child_req.prompt_token_ids),
+                    explicit_prior_indices[branch_id]
+                    if explicit_prior_indices is not None
+                    else self.vllm_config.berag_config.default_prior_token_offset,
+                )
+                max_tokens = child_params.max_tokens or 0
+                if len(child_req.prompt_token_ids) + max_tokens > (
+                    self.model_config.max_model_len
+                ):
+                    raise ValueError(
+                        "BERAG child prompt plus max_tokens exceeds max_model_len: "
+                        f"branch_id={branch_id}, prompt_len="
+                        f"{len(child_req.prompt_token_ids)}, "
+                        f"max_tokens={max_tokens}, "
+                        f"max_model_len={self.model_config.max_model_len}."
+                    )
+                child_req.berag_child = BeragChildMetadata(
+                    group_id=parent_id,
+                    parent_request_id=parent_id,
+                    branch_id=branch_id,
+                    num_branches=len(documents),
+                    parent_prompt_len=parent_prompt_len,
+                    prior_token_index=prior_index,
+                    pruning_top_p=berag_params.pruning_top_p,
+                    debug=debug,
+                )
+                child_req.external_req_id = child_req.request_id
+                if debug:
+                    logger.info(
+                        "[BERAG debug] admission child=%s branch=%d/%d "
+                        "prompt_len=%d prior_token_index=%d max_tokens=%s",
+                        child_req.request_id,
+                        branch_id,
+                        len(documents),
+                        len(child_req.prompt_token_ids),
+                        prior_index,
+                        child_params.max_tokens,
+                    )
+                self.engine_core.add_request(child_req)
+                child_request_ids.append(child_req.request_id)
+        except Exception:
+            if parent_id is not None:
+                self.output_processor.abort_requests([parent_id], internal=True)
+            if child_request_ids:
+                self.engine_core.abort_requests(child_request_ids)
+            if parent_id is not None:
+                self._berag_child_ids_by_parent_id.pop(parent_id, None)
+            if not mode_was_active:
+                self._berag_mode_active = False
+            raise
+
+        assert parent_id is not None
+        self._berag_child_ids_by_parent_id[parent_id] = child_request_ids
+        return parent_id
+
+    def _validate_berag_request(
+        self,
+        documents: list[str],
+        sampling_params: SamplingParams,
+        berag_params: BeragParams,
+    ) -> None:
+        if not documents:
+            raise ValueError("BERAG requires at least one document branch.")
+        if not (0.0 < berag_params.pruning_top_p <= 1.0):
+            raise ValueError("BeragParams.pruning_top_p must be in (0, 1].")
+        berag_config = self.vllm_config.berag_config
+        if not berag_config.prior_module_cls or not (
+            berag_config.prior_module_weights_path
+        ):
+            raise ValueError(
+                "BERAG requires berag_prior_module_cls and "
+                "berag_prior_module_weights_path."
+            )
+        parallel_config = self.vllm_config.parallel_config
+        if (
+            parallel_config.tensor_parallel_size != 1
+            or parallel_config.pipeline_parallel_size != 1
+            or parallel_config.data_parallel_size != 1
+        ):
+            raise ValueError("BERAG currently supports only single-GPU execution.")
+        if self.vllm_config.scheduler_config.async_scheduling:
+            raise ValueError("BERAG does not support async scheduling.")
+        if self.vllm_config.speculative_config is not None:
+            raise ValueError("BERAG does not support speculative decoding.")
+        if sampling_params.n != 1:
+            raise ValueError("BERAG requires SamplingParams.n == 1.")
+        if sampling_params.structured_outputs is not None:
+            raise ValueError("BERAG does not support structured-output grammar.")
+        if sampling_params.repetition_penalty != 1.0:
+            raise ValueError(
+                "BERAG does not support repetition_penalty because parent-level "
+                "prompt masking is not represented by child worker rows."
+            )
+        if sampling_params.min_tokens:
+            raise ValueError(
+                "BERAG does not support min_tokens because parent-level "
+                "minimum-length masking is not represented by child worker rows."
+            )
+        if sampling_params.bad_words_token_ids:
+            raise ValueError(
+                "BERAG does not support bad_words because parent-level bad-word "
+                "matching is not represented by child worker rows."
+            )
+
+    @staticmethod
+    def _resolve_berag_prior_index(prompt_len: int, index: int) -> int:
+        resolved = prompt_len + index if index < 0 else index
+        if resolved < 0 or resolved >= prompt_len:
+            raise ValueError(
+                f"BERAG prior_token_index {index} is outside prompt length "
+                f"{prompt_len}."
+            )
+        return resolved
+
     def step(self) -> list[RequestOutput | PoolingRequestOutput]:
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
@@ -312,10 +527,16 @@ class LLMEngine:
                 iteration_stats=iteration_stats,
             )
             self.output_processor.update_scheduler_stats(outputs.scheduler_stats)
+            for output in outputs.outputs:
+                if output.finish_reason is not None:
+                    self._berag_child_ids_by_parent_id.pop(output.request_id, None)
 
         # 3) Abort any reqs that finished due to stop strings.
         with record_function_or_nullcontext("llm_engine step: abort_requests"):
-            self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
+            reqs_to_abort = self._expand_berag_abort_request_ids(
+                processed_outputs.reqs_to_abort
+            )
+            self.engine_core.abort_requests(reqs_to_abort)
 
         # 4) Record stats
         with record_function_or_nullcontext("llm_engine step: record_stats"):

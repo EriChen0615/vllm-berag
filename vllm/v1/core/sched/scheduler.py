@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -40,9 +41,12 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
+    BeragCommittedTokens,
+    BeragReleaseRows,
     CachedRequestData,
     GrammarOutput,
     NewRequestData,
+    ScheduledBeragShard,
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
@@ -63,6 +67,72 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class BeragRowAllocator:
+    num_rows: int
+    free_rows: deque[int] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.free_rows = deque(range(self.num_rows))
+
+    @property
+    def free_count(self) -> int:
+        return len(self.free_rows)
+
+    def allocate(self) -> int:
+        return self.free_rows.popleft()
+
+    def release(self, rows: Iterable[int]) -> None:
+        for row in rows:
+            self.free_rows.append(row)
+
+
+@dataclass
+class BeragGroupState:
+    group_id: str
+    parent_request_id: str
+    num_branches: int
+    pruning_top_p: float
+    debug: bool = False
+    child_request_ids: dict[int, str] = field(default_factory=dict)
+    active_branch_ids: set[int] = field(default_factory=set)
+    prior_token_indices: dict[int, int] = field(default_factory=dict)
+    prior_scores: dict[int, float] = field(default_factory=dict)
+    log_posterior: dict[int, float] = field(default_factory=dict)
+    step_id: int = 0
+    completed_branch_ids: set[int] = field(default_factory=set)
+    mixture_row_id: int | None = None
+    branch_row_ids: dict[int, int] = field(default_factory=dict)
+    pending_finalize: bool = False
+
+    def register_child(self, request: Request) -> None:
+        meta = request.berag_child
+        assert meta is not None
+        self.child_request_ids[meta.branch_id] = request.request_id
+        self.active_branch_ids.add(meta.branch_id)
+        self.prior_token_indices[meta.branch_id] = meta.prior_token_index
+        self.debug = self.debug or meta.debug
+
+    @property
+    def all_children_registered(self) -> bool:
+        return len(self.child_request_ids) == self.num_branches
+
+    @property
+    def priors_ready(self) -> bool:
+        return self.active_branch_ids.issubset(self.prior_scores)
+
+    @property
+    def step_evidence_ready(self) -> bool:
+        return self.active_branch_ids.issubset(self.completed_branch_ids)
+
+    def reset_step(self) -> None:
+        self.step_id += 1
+        self.completed_branch_ids.clear()
+        self.mixture_row_id = None
+        self.branch_row_ids.clear()
+        self.pending_finalize = False
 
 
 class Scheduler(SchedulerInterface):
@@ -327,6 +397,25 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        self.berag_config = vllm_config.berag_config
+        self.berag_groups: dict[str, BeragGroupState] = {}
+        self.berag_row_allocator = BeragRowAllocator(
+            self.berag_config.num_accumulator_rows
+        )
+        self.berag_release_rows: list[BeragReleaseRows] = []
+        self.berag_committed_tokens: list[BeragCommittedTokens] = []
+        if self.berag_config.enabled:
+            if (
+                self.parallel_config.tensor_parallel_size != 1
+                or self.parallel_config.pipeline_parallel_size != 1
+                or self.parallel_config.data_parallel_size != 1
+            ):
+                raise ValueError("BERAG scheduler supports only single-GPU execution.")
+            if self.scheduler_config.async_scheduling:
+                raise ValueError("BERAG scheduler does not support async scheduling.")
+            if self.vllm_config.speculative_config is not None:
+                raise ValueError("BERAG scheduler does not support speculative decode.")
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -385,8 +474,493 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = num_new_tokens // block_size * block_size
         return num_new_tokens
 
+    def _make_empty_scheduler_output(
+        self,
+        *,
+        scheduled_berag_shards: list[ScheduledBeragShard] | None = None,
+    ) -> SchedulerOutput:
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = self.finished_req_ids
+        output.berag_release_rows = self._take_berag_release_rows()
+        output.berag_committed_tokens = self._take_berag_committed_tokens()
+        output.scheduled_berag_shards = scheduled_berag_shards
+        return output
+
+    def _take_berag_release_rows(self) -> list[BeragReleaseRows] | None:
+        if not self.berag_release_rows:
+            return None
+        rows = self.berag_release_rows
+        self.berag_release_rows = []
+        return rows
+
+    def _take_berag_committed_tokens(self) -> list[BeragCommittedTokens] | None:
+        if not self.berag_committed_tokens:
+            return None
+        commands = self.berag_committed_tokens
+        self.berag_committed_tokens = []
+        return commands
+
+    @staticmethod
+    def _berag_debug(group: BeragGroupState, message: str, *args: Any) -> None:
+        if not group.debug:
+            return
+        logger.info(
+            "[BERAG debug] scheduler group=%s step=%d " + message,
+            group.group_id,
+            group.step_id,
+            *args,
+        )
+
+    def _find_ready_berag_finalize(self) -> ScheduledBeragShard | None:
+        for group in self.berag_groups.values():
+            if (
+                group.pending_finalize
+                and group.all_children_registered
+                and group.priors_ready
+                and group.step_evidence_ready
+                and group.mixture_row_id is not None
+            ):
+                self._ensure_berag_posterior(group)
+                branch_ids = sorted(group.active_branch_ids)
+                req_ids = [
+                    group.child_request_ids[branch_id] for branch_id in branch_ids
+                ]
+                row_ids = [
+                    group.branch_row_ids[branch_id] for branch_id in branch_ids
+                ]
+                self._berag_debug(
+                    group,
+                    "emit deferred final shard branches=%s rows=%s "
+                    "log_posterior=%s",
+                    branch_ids,
+                    row_ids,
+                    [group.log_posterior[branch_id] for branch_id in branch_ids],
+                )
+                return ScheduledBeragShard(
+                    group_id=group.group_id,
+                    step_id=group.step_id,
+                    req_ids=req_ids,
+                    branch_ids=branch_ids,
+                    mixture_row_id=group.mixture_row_id,
+                    branch_row_ids=row_ids,
+                    log_posterior=[
+                        group.log_posterior[branch_id] for branch_id in branch_ids
+                    ],
+                    is_final_shard=True,
+                    sample_on_completion=True,
+                    debug=group.debug,
+                )
+        return None
+
+    @staticmethod
+    def _berag_range_covers_prior(
+        request: Request, num_new_tokens: int
+    ) -> bool:
+        meta = request.berag_child
+        if meta is None:
+            return False
+        start = request.num_computed_tokens
+        end = start + num_new_tokens
+        return start <= meta.prior_token_index < end
+
+    @staticmethod
+    def _berag_emits_evidence(request: Request, num_new_tokens: int) -> bool:
+        if request.berag_child is None:
+            return False
+        return request.num_computed_tokens + num_new_tokens >= request.num_tokens
+
+    def _berag_group_is_ready_to_schedule(self, request: Request) -> bool:
+        meta = request.berag_child
+        if meta is None:
+            return True
+        group = self.berag_groups[meta.group_id]
+        if group.all_children_registered:
+            return True
+        self._berag_debug(
+            group,
+            "defer scheduling req=%s branch=%d until all children are "
+            "registered children=%d/%d",
+            request.request_id,
+            meta.branch_id,
+            len(group.child_request_ids),
+            group.num_branches,
+        )
+        return False
+
+    def _berag_rows_needed(self, request: Request) -> int:
+        meta = request.berag_child
+        assert meta is not None
+        group = self.berag_groups[meta.group_id]
+        needed = 0 if group.mixture_row_id is not None else 1
+        if meta.branch_id not in group.branch_row_ids:
+            needed += 1
+        return needed
+
+    def _try_reserve_berag_rows(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        reserved_mixture_groups: set[str],
+        reserved_branch_rows: set[tuple[str, int]],
+    ) -> bool:
+        meta = request.berag_child
+        if meta is None or not self._berag_emits_evidence(request, num_new_tokens):
+            return True
+        group = self.berag_groups[meta.group_id]
+        needed = 0
+        if (
+            group.mixture_row_id is None
+            and meta.group_id not in reserved_mixture_groups
+        ):
+            needed += 1
+        branch_key = (meta.group_id, meta.branch_id)
+        if meta.branch_id not in group.branch_row_ids and (
+            branch_key not in reserved_branch_rows
+        ):
+            needed += 1
+        already_reserved = len(reserved_mixture_groups) + len(reserved_branch_rows)
+        if self.berag_row_allocator.free_count - already_reserved < needed:
+            self._berag_debug(
+                group,
+                "row backpressure branch=%d needed=%d free=%d "
+                "already_reserved=%d",
+                meta.branch_id,
+                needed,
+                self.berag_row_allocator.free_count,
+                already_reserved,
+            )
+            return False
+        if group.mixture_row_id is None:
+            reserved_mixture_groups.add(meta.group_id)
+        if meta.branch_id not in group.branch_row_ids:
+            reserved_branch_rows.add(branch_key)
+        return True
+
+    def _build_scheduled_berag_shards(
+        self,
+        num_scheduled_tokens: dict[str, int],
+    ) -> list[ScheduledBeragShard] | None:
+        shards: list[ScheduledBeragShard] = []
+        group_to_req_ids: dict[str, list[str]] = defaultdict(list)
+        group_to_prior_req_ids: dict[str, list[str]] = defaultdict(list)
+        for req_id, num_tokens in num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            if request.berag_child is None:
+                continue
+            meta = request.berag_child
+            if self._berag_emits_evidence(request, num_tokens):
+                group_to_req_ids[meta.group_id].append(req_id)
+            if self._berag_range_covers_prior(request, num_tokens):
+                group_to_prior_req_ids[meta.group_id].append(req_id)
+
+        for group_id in set(group_to_req_ids) | set(group_to_prior_req_ids):
+            group = self.berag_groups[group_id]
+            if not group.all_children_registered:
+                raise RuntimeError(
+                    "BERAG scheduled a shard before all child requests were "
+                    f"registered: group={group_id}, "
+                    f"children={len(group.child_request_ids)}/"
+                    f"{group.num_branches}."
+                )
+            req_ids = group_to_req_ids.get(group_id, [])
+            branch_ids: list[int] = []
+            branch_row_ids: list[int] = []
+            if req_ids and group.mixture_row_id is None:
+                group.mixture_row_id = self.berag_row_allocator.allocate()
+            for req_id in req_ids:
+                meta = self.requests[req_id].berag_child
+                assert meta is not None
+                branch_ids.append(meta.branch_id)
+                if meta.branch_id not in group.branch_row_ids:
+                    group.branch_row_ids[meta.branch_id] = (
+                        self.berag_row_allocator.allocate()
+                    )
+                branch_row_ids.append(group.branch_row_ids[meta.branch_id])
+
+            completed_after = group.completed_branch_ids | set(branch_ids)
+            is_final = group.active_branch_ids.issubset(completed_after)
+            priors_ready = group.priors_ready
+            sample_on_completion = bool(is_final and priors_ready)
+            if is_final and not sample_on_completion:
+                group.pending_finalize = True
+
+            prior_req_ids = group_to_prior_req_ids.get(group_id)
+            prior_token_indices = None
+            if prior_req_ids:
+                prior_token_indices = []
+                for req_id in prior_req_ids:
+                    meta = self.requests[req_id].berag_child
+                    assert meta is not None
+                    prior_token_indices.append(meta.prior_token_index)
+            shard = ScheduledBeragShard(
+                group_id=group_id,
+                step_id=group.step_id,
+                req_ids=req_ids,
+                branch_ids=branch_ids,
+                mixture_row_id=group.mixture_row_id
+                if group.mixture_row_id is not None
+                else -1,
+                branch_row_ids=branch_row_ids,
+                log_posterior=[
+                    group.log_posterior.get(branch_id, 0.0)
+                    for branch_id in branch_ids
+                ],
+                is_final_shard=is_final,
+                sample_on_completion=sample_on_completion,
+                prior_req_ids=prior_req_ids,
+                prior_token_indices=prior_token_indices,
+                debug=group.debug,
+            )
+            self._berag_debug(
+                group,
+                "emit shard branches=%s reqs=%s rows=%s mixture_row=%s "
+                "prior_reqs=%s final=%s sample=%s pending_finalize=%s "
+                "completed_before=%s active=%s",
+                branch_ids,
+                req_ids,
+                branch_row_ids,
+                shard.mixture_row_id,
+                prior_req_ids,
+                is_final,
+                sample_on_completion,
+                group.pending_finalize,
+                sorted(group.completed_branch_ids),
+                sorted(group.active_branch_ids),
+            )
+            shards.append(shard)
+        return shards or None
+
+    @staticmethod
+    def _normalize_logs(log_values: dict[int, float]) -> dict[int, float]:
+        max_log = max(log_values.values())
+        denom = max_log + math.log(
+            sum(math.exp(value - max_log) for value in log_values.values())
+        )
+        return {key: value - denom for key, value in log_values.items()}
+
+    def _ensure_berag_posterior(self, group: BeragGroupState) -> None:
+        if group.log_posterior:
+            return
+        group.log_posterior = self._normalize_logs(
+            {
+                branch_id: group.prior_scores[branch_id]
+                for branch_id in group.active_branch_ids
+            }
+        )
+
+    def _select_berag_pruned_branches(self, group: BeragGroupState) -> list[int]:
+        if group.pruning_top_p >= 1.0 or len(group.active_branch_ids) <= 1:
+            return []
+        probs = {
+            branch_id: math.exp(group.log_posterior[branch_id])
+            for branch_id in group.active_branch_ids
+        }
+        ordered = sorted(probs, key=lambda branch_id: (-probs[branch_id], branch_id))
+        kept: set[int] = set()
+        mass = 0.0
+        for branch_id in ordered:
+            kept.add(branch_id)
+            mass += probs[branch_id]
+            if mass >= group.pruning_top_p:
+                break
+        if not kept:
+            kept.add(ordered[0])
+        return sorted(group.active_branch_ids - kept)
+
+    def _release_berag_step_rows(self, group: BeragGroupState) -> None:
+        row_ids = list(group.branch_row_ids.values())
+        if group.mixture_row_id is not None:
+            row_ids.append(group.mixture_row_id)
+        if not row_ids:
+            return
+        self.berag_row_allocator.release(row_ids)
+        self._berag_debug(group, "release rows=%s", row_ids)
+        self.berag_release_rows.append(
+            BeragReleaseRows(
+                group_id=group.group_id,
+                step_id=group.step_id,
+                row_ids=row_ids,
+                debug=group.debug,
+            )
+        )
+
+    def _update_berag_from_output(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        outputs: dict[int, list[EngineCoreOutput]],
+    ) -> set[Request]:
+        stopped_running: set[Request] = set()
+        for berag_output in model_runner_output.berag_outputs or []:
+            group = self.berag_groups.get(berag_output.group_id)
+            if group is None or berag_output.step_id != group.step_id:
+                continue
+            if berag_output.prior_scores:
+                group.prior_scores.update(berag_output.prior_scores)
+                self._berag_debug(
+                    group,
+                    "received prior_scores=%s priors_ready=%s active=%s",
+                    berag_output.prior_scores,
+                    group.priors_ready,
+                    sorted(group.active_branch_ids),
+                )
+            group.completed_branch_ids.update(berag_output.completed_branch_ids)
+            self._berag_debug(
+                group,
+                "received branch evidence completed_now=%s completed_step=%s "
+                "evidence_ready=%s sampled_token=%s",
+                berag_output.completed_branch_ids,
+                sorted(group.completed_branch_ids),
+                group.step_evidence_ready,
+                berag_output.sampled_token_id,
+            )
+
+            if berag_output.sampled_token_id is None:
+                continue
+
+            self._ensure_berag_posterior(group)
+            if berag_output.sampled_token_logprobs:
+                updated = {
+                    branch_id: group.log_posterior[branch_id]
+                    + berag_output.sampled_token_logprobs[branch_id]
+                    for branch_id in group.active_branch_ids
+                }
+                group.log_posterior = self._normalize_logs(updated)
+            self._berag_debug(
+                group,
+                "posterior updated sampled_token=%s sampled_logprobs=%s "
+                "log_posterior=%s",
+                berag_output.sampled_token_id,
+                berag_output.sampled_token_logprobs,
+                group.log_posterior,
+            )
+
+            sampled_token_id = berag_output.sampled_token_id
+            stopped = False
+            finish_reason = None
+            representative: Request | None = None
+            for branch_id in sorted(group.active_branch_ids):
+                req_id = group.child_request_ids[branch_id]
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+                representative = representative or request
+                _, branch_stopped = self._update_request_with_output(
+                    request, [sampled_token_id]
+                )
+                stopped |= branch_stopped
+                if branch_stopped:
+                    finish_reason = request.get_finished_reason()
+                    stopped_running.add(request)
+
+            pruned_branch_ids: list[int] = []
+            committed_req_ids = [
+                group.child_request_ids[branch_id]
+                for branch_id in sorted(group.active_branch_ids)
+            ]
+            self.berag_committed_tokens.append(
+                BeragCommittedTokens(
+                    group_id=group.group_id,
+                    step_id=group.step_id,
+                    req_ids=committed_req_ids,
+                    token_id=sampled_token_id,
+                    debug=group.debug,
+                )
+            )
+            self._berag_debug(
+                group,
+                "commit token=%d to reqs=%s stopped=%s finish_reason=%s",
+                sampled_token_id,
+                committed_req_ids,
+                stopped,
+                finish_reason,
+            )
+            if not stopped:
+                pruned_branch_ids = self._select_berag_pruned_branches(group)
+                for branch_id in pruned_branch_ids:
+                    req_id = group.child_request_ids[branch_id]
+                    request = self.requests.get(req_id)
+                    if request is None or request.is_finished():
+                        continue
+                    request.status = RequestStatus.FINISHED_IGNORED
+                    self._free_request(request)
+                    stopped_running.add(request)
+                    group.active_branch_ids.remove(branch_id)
+                    group.log_posterior.pop(branch_id, None)
+                if pruned_branch_ids and group.log_posterior:
+                    group.log_posterior = self._normalize_logs(group.log_posterior)
+                self._berag_debug(
+                    group,
+                    "pruned=%s remaining=%s log_posterior=%s",
+                    pruned_branch_ids,
+                    sorted(group.active_branch_ids),
+                    group.log_posterior,
+                )
+
+            if stopped:
+                self._berag_debug(group, "group stopping; freeing active branches")
+                self._release_berag_step_rows(group)
+                for branch_id in sorted(group.active_branch_ids):
+                    req_id = group.child_request_ids[branch_id]
+                    request = self.requests.get(req_id)
+                    if request is None:
+                        continue
+                    if not request.is_finished():
+                        request.status = RequestStatus.FINISHED_STOPPED
+                    self._free_request(request)
+                    stopped_running.add(request)
+                self.berag_groups.pop(group.group_id, None)
+            else:
+                self._release_berag_step_rows(group)
+                group.reset_step()
+                self._berag_debug(
+                    group,
+                    "advance to next step active=%s",
+                    sorted(group.active_branch_ids),
+                )
+
+            if representative is not None:
+                outputs[representative.client_index].append(
+                    EngineCoreOutput(
+                        request_id=group.parent_request_id,
+                        new_token_ids=[sampled_token_id],
+                        finish_reason=finish_reason if stopped else None,
+                        new_logprobs=berag_output.logprobs,
+                        stop_reason=representative.stop_reason,
+                        trace_headers=representative.trace_headers,
+                    )
+                )
+        return stopped_running
+
+    def _check_berag_row_telemetry(
+        self, model_runner_output: ModelRunnerOutput
+    ) -> None:
+        telemetry = model_runner_output.berag_row_pool
+        if telemetry is None:
+            return
+        total_rows = self.berag_config.num_accumulator_rows
+        expected_free = self.berag_row_allocator.free_count
+        expected_live = total_rows - expected_free
+        if (
+            telemetry.total_rows != total_rows
+            or telemetry.free_rows != expected_free
+            or telemetry.live_rows != expected_live
+        ):
+            raise RuntimeError(
+                "BERAG accumulator row telemetry mismatch: "
+                f"worker=(total={telemetry.total_rows}, "
+                f"free={telemetry.free_rows}, live={telemetry.live_rows}), "
+                f"scheduler=(total={total_rows}, free={expected_free}, "
+                f"live={expected_live})."
+            )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if berag_finalize := self._find_ready_berag_finalize():
+            output = self._make_empty_scheduler_output(
+                scheduled_berag_shards=[berag_finalize]
+            )
+            self.finished_req_ids = set()
+            return output
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -405,6 +979,8 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        berag_reserved_mixture_groups: set[str] = set()
+        berag_reserved_branch_rows: set[tuple[str, int]] = set()
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -431,6 +1007,10 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if not self._berag_group_is_ready_to_schedule(request):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -516,6 +1096,15 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
+                req_index += 1
+                continue
+
+            if not self._try_reserve_berag_rows(
+                request,
+                num_new_tokens,
+                berag_reserved_mixture_groups,
+                berag_reserved_branch_rows,
+            ):
                 req_index += 1
                 continue
 
@@ -635,6 +1224,11 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if not self._berag_group_is_ready_to_schedule(request):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -840,6 +1434,16 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
+
+                if not self._try_reserve_berag_rows(
+                    request,
+                    num_new_tokens,
+                    berag_reserved_mixture_groups,
+                    berag_reserved_branch_rows,
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
@@ -1073,6 +1677,11 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            scheduled_berag_shards=self._build_scheduled_berag_shards(
+                num_scheduled_tokens
+            ),
+            berag_release_rows=self._take_berag_release_rows(),
+            berag_committed_tokens=self._take_berag_committed_tokens(),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1522,7 +2131,10 @@ class Scheduler(SchedulerInterface):
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
-        stopped_running_reqs: set[Request] = set()
+        self._check_berag_row_telemetry(model_runner_output)
+        stopped_running_reqs: set[Request] = self._update_berag_from_output(
+            model_runner_output, outputs
+        )
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
@@ -1962,6 +2574,13 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        if request.berag_child is None and self.berag_groups:
+            raise ValueError("Ordinary requests are not supported in BERAG mode.")
+        if request.berag_child is not None and any(
+            req.berag_child is None for req in self.requests.values()
+        ):
+            raise ValueError("BERAG requests cannot be mixed with ordinary requests.")
+
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -1984,6 +2603,46 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            if request.berag_child is not None:
+                self._register_berag_child(request)
+
+    def _register_berag_child(self, request: Request) -> None:
+        meta = request.berag_child
+        assert meta is not None
+        group = self.berag_groups.get(meta.group_id)
+        if group is None:
+            group = BeragGroupState(
+                group_id=meta.group_id,
+                parent_request_id=meta.parent_request_id,
+                num_branches=meta.num_branches,
+                pruning_top_p=meta.pruning_top_p,
+            )
+            self.berag_groups[meta.group_id] = group
+        group.register_child(request)
+        self._berag_debug(
+            group,
+            "registered child req=%s branch=%d/%d prior_token_index=%d "
+            "children=%d",
+            request.request_id,
+            meta.branch_id,
+            meta.num_branches,
+            meta.prior_token_index,
+            len(group.child_request_ids),
+        )
+
+    def _finish_berag_child_from_abort(self, request: Request) -> None:
+        meta = request.berag_child
+        if meta is None:
+            return
+        group = self.berag_groups.get(meta.group_id)
+        if group is None:
+            return
+        group.active_branch_ids.discard(meta.branch_id)
+        group.log_posterior.pop(meta.branch_id, None)
+        if group.active_branch_ids:
+            return
+        self._release_berag_step_rows(group)
+        self.berag_groups.pop(meta.group_id, None)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2045,6 +2704,7 @@ class Scheduler(SchedulerInterface):
 
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
+            self._finish_berag_child_from_abort(request)
 
         return [(r.request_id, r.client_index) for r in valid_requests]
 

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.berag import BeragChildMetadata
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -76,6 +77,7 @@ class Request:
         resumable: bool = False,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        berag_child: BeragChildMetadata | None = None,
         abort_immediately: bool = False,
     ) -> None:
         self.request_id = request_id
@@ -193,6 +195,7 @@ class Request:
         # If True, request should be aborted immediately after being added to
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
+        self.berag_child = berag_child
 
     @classmethod
     def from_engine_core_request(
@@ -218,6 +221,7 @@ class Request:
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
+            berag_child=request.berag_child,
             abort_immediately=request.abort_immediately,
         )
 

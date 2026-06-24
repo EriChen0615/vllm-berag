@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from vllm.berag import BeragChildMetadata
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -39,6 +41,7 @@ class NewRequestData:
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    berag_child: BeragChildMetadata | None = None
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -61,6 +64,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
+            berag_child=request.berag_child,
             prefill_token_ids=prefill_token_ids,
         )
 
@@ -178,6 +182,39 @@ class CachedRequestData:
 
 
 @dataclass
+class ScheduledBeragShard:
+    group_id: str
+    step_id: int
+    req_ids: list[str]
+    branch_ids: list[int]
+    mixture_row_id: int
+    branch_row_ids: list[int]
+    log_posterior: list[float]
+    is_final_shard: bool
+    sample_on_completion: bool = True
+    prior_req_ids: list[str] | None = None
+    prior_token_indices: list[int] | None = None
+    debug: bool = False
+
+
+@dataclass
+class BeragCommittedTokens:
+    group_id: str
+    step_id: int
+    req_ids: list[str]
+    token_id: int
+    debug: bool = False
+
+
+@dataclass
+class BeragReleaseRows:
+    group_id: str
+    step_id: int
+    row_ids: list[int]
+    debug: bool = False
+
+
+@dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
@@ -243,6 +280,11 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # BERAG metadata and worker commands.
+    scheduled_berag_shards: list[ScheduledBeragShard] | None = None
+    berag_committed_tokens: list[BeragCommittedTokens] | None = None
+    berag_release_rows: list[BeragReleaseRows] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

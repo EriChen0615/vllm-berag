@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.berag import BeragChildMetadata
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -44,12 +45,18 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import (
+    BeragModelRunnerOutput,
+    BeragRowPoolTelemetry,
+    DraftTokenIds,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -116,6 +123,35 @@ from vllm.v1.worker.utils import KVBlockZeroer
 logger = init_logger(__name__)
 
 
+class BeragAccumulator:
+    def __init__(
+        self,
+        num_rows: int,
+        vocab_size: int,
+        device: torch.device,
+    ) -> None:
+        self.workspace = torch.empty(
+            (num_rows, vocab_size), dtype=torch.bfloat16, device=device
+        )
+        self.total_rows = num_rows
+        self.live_rows: set[int] = set()
+
+    def release(self, row_ids: list[int]) -> None:
+        for row_id in row_ids:
+            self.live_rows.discard(row_id)
+
+    def mark_live(self, row_id: int) -> None:
+        if row_id >= 0:
+            self.live_rows.add(row_id)
+
+    def telemetry(self) -> BeragRowPoolTelemetry:
+        return BeragRowPoolTelemetry(
+            total_rows=self.total_rows,
+            free_rows=self.total_rows - len(self.live_rows),
+            live_rows=len(self.live_rows),
+        )
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -147,6 +183,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
+        self.berag_config = vllm_config.berag_config
+        self.berag_accumulator: BeragAccumulator | None = None
+        self.berag_prior_module: nn.Module | None = None
+        self.berag_child_by_req_id: dict[str, BeragChildMetadata] = {}
+        if self.berag_config.enabled:
+            self.berag_accumulator = BeragAccumulator(
+                self.berag_config.num_accumulator_rows,
+                self.vocab_size,
+                self.device,
+            )
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
 
@@ -296,6 +342,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
+            self._load_berag_prior_module()
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -367,6 +414,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dtype=self.model_config.dtype,
                 device=self.device,
             )
+
+    def _load_berag_prior_module(self) -> None:
+        if not self.berag_config.enabled:
+            return
+        if not self.berag_config.prior_module_cls:
+            raise ValueError("BERAG requires prior_module_cls.")
+        if not self.berag_config.prior_module_weights_path:
+            raise ValueError("BERAG requires prior_module_weights_path.")
+        cls = resolve_obj_by_qualname(self.berag_config.prior_module_cls)
+        module = cls(**self.berag_config.prior_module_kwargs)
+        state = torch.load(
+            self.berag_config.prior_module_weights_path,
+            map_location=self.device,
+            weights_only=True,
+        )
+        module.load_state_dict(state)
+        module.to(device=self.device, dtype=torch.bfloat16)
+        module.eval()
+        self.berag_prior_module = module
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -574,6 +640,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return None, None
 
         assert self.execute_model_state is not None
+        scheduler_output = self.execute_model_state.scheduler_output
         input_batch = self.execute_model_state.input_batch
         attn_metadata = self.execute_model_state.attn_metadata
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
@@ -731,6 +798,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
+        self.berag_child_by_req_id.pop(req_id, None)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -772,6 +840,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert new_req_data.prompt_token_ids is not None
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
+            if new_req_data.berag_child is not None:
+                self.berag_child_by_req_id[req_id] = new_req_data.berag_child
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
@@ -840,6 +910,272 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+
+    def apply_berag_worker_commands(self, scheduler_output: SchedulerOutput) -> None:
+        if self.berag_accumulator is not None and scheduler_output.berag_release_rows:
+            for release in scheduler_output.berag_release_rows:
+                self.berag_accumulator.release(release.row_ids)
+                if release.debug:
+                    logger.info(
+                        "[BERAG debug] worker group=%s step=%d release rows=%s "
+                        "telemetry=%s",
+                        release.group_id,
+                        release.step_id,
+                        release.row_ids,
+                        self.berag_accumulator.telemetry(),
+                    )
+
+        if not scheduler_output.berag_committed_tokens:
+            return
+        for command in scheduler_output.berag_committed_tokens:
+            if command.debug:
+                logger.info(
+                    "[BERAG debug] worker group=%s step=%d apply committed "
+                    "token=%d reqs=%s",
+                    command.group_id,
+                    command.step_id,
+                    command.token_id,
+                    command.req_ids,
+                )
+            for req_id in command.req_ids:
+                req_idx = self.req_states.req_id_to_index.get(req_id)
+                if req_idx is None:
+                    if command.debug:
+                        logger.info(
+                            "[BERAG debug] worker group=%s step=%d skip "
+                            "commit for missing req=%s",
+                            command.group_id,
+                            command.step_id,
+                            req_id,
+                        )
+                    continue
+                total_len = int(self.req_states.total_len.gpu[req_idx].item())
+                self.req_states.all_token_ids.stage_write(
+                    req_idx, total_len, [command.token_id]
+                )
+                self.req_states.total_len.stage_write_elem(req_idx, total_len + 1)
+                self.req_states.last_sampled_tokens[req_idx : req_idx + 1] = (
+                    command.token_id
+                )
+                if self.sampler is not None:
+                    self.sampler.penalties_state.output_bin_counts[
+                        req_idx, command.token_id
+                    ] += 1
+        self.req_states.total_len.apply_write()
+        self.req_states.all_token_ids.apply_write()
+
+    def _berag_row_pool(self) -> BeragRowPoolTelemetry | None:
+        if self.berag_accumulator is None:
+            return None
+        return self.berag_accumulator.telemetry()
+
+    @staticmethod
+    def _berag_debug_shard(shard: Any, message: str, *args: Any) -> None:
+        if not shard.debug:
+            return
+        logger.info(
+            "[BERAG debug] worker group=%s step=%d " + message,
+            shard.group_id,
+            shard.step_id,
+            *args,
+        )
+
+    @staticmethod
+    def _berag_debug_enabled(scheduler_output: SchedulerOutput) -> bool:
+        return any(
+            shard.debug for shard in scheduler_output.scheduled_berag_shards or []
+        )
+
+    def _make_empty_berag_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        berag_outputs: list[BeragModelRunnerOutput] | None = None,
+    ) -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            kv_connector_output=self.kv_connector.no_forward(scheduler_output)
+            .kv_connector_output,
+            berag_outputs=berag_outputs,
+            berag_row_pool=self._berag_row_pool(),
+        )
+
+    def _berag_prior_score(
+        self, hidden_state: torch.Tensor
+    ) -> float:
+        assert self.berag_prior_module is not None
+        with torch.inference_mode():
+            score = self.berag_prior_module(hidden_state.unsqueeze(0))
+        return float(score.reshape(-1)[0].detach().float().cpu().item())
+
+    def _sample_berag_mixture(
+        self,
+        logits: torch.Tensor,
+        representative_req_id: str,
+    ) -> int:
+        assert self.sampler is not None
+        req_idx = self.req_states.req_id_to_index[representative_req_id]
+        meta = self.berag_child_by_req_id[representative_req_id]
+        idx_mapping_np = np.asarray([req_idx], dtype=np.int32)
+        idx_mapping = torch.tensor([req_idx], dtype=torch.int32, device=self.device)
+        total_len = int(self.req_states.total_len.gpu[req_idx].item())
+        child_prompt_len = int(self.req_states.prompt_len.gpu[req_idx].item())
+        generated_len = total_len - child_prompt_len
+        pos = torch.tensor(
+            [max(meta.parent_prompt_len + generated_len - 1, 0)],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        input_ids = self.req_states.last_sampled_tokens[req_idx].view(1).to(torch.int32)
+        local_pos = torch.zeros(1, dtype=torch.int32, device=self.device)
+        sampled, _ = self.sampler.sample(
+            logits.view(1, -1),
+            idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            local_pos,
+            return_logprobs=False,
+        )
+        return int(sampled.reshape(-1)[0].cpu().item())
+
+    def _process_berag_shards(
+        self,
+        scheduler_output: SchedulerOutput,
+        input_batch: InputBatch | None,
+        hidden_states: torch.Tensor | None,
+    ) -> list[BeragModelRunnerOutput] | None:
+        shards = scheduler_output.scheduled_berag_shards
+        if not shards:
+            return None
+        assert self.berag_accumulator is not None
+        outputs: list[BeragModelRunnerOutput] = []
+        logits = None
+        if input_batch is not None and hidden_states is not None:
+            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            logits = self.model.compute_logits(sample_hidden_states)
+        req_id_to_batch_index = (
+            {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
+            if input_batch is not None
+            else {}
+        )
+
+        for shard in shards:
+            if shard.mixture_row_id >= 0:
+                self.berag_accumulator.mark_live(shard.mixture_row_id)
+            self._berag_debug_shard(
+                shard,
+                "process shard reqs=%s branches=%s rows=%s mixture_row=%s "
+                "final=%s sample=%s prior_reqs=%s telemetry=%s",
+                shard.req_ids,
+                shard.branch_ids,
+                shard.branch_row_ids,
+                shard.mixture_row_id,
+                shard.is_final_shard,
+                shard.sample_on_completion,
+                shard.prior_req_ids,
+                self.berag_accumulator.telemetry(),
+            )
+            prior_scores: dict[int, float] = {}
+            if (
+                shard.prior_req_ids
+                and shard.prior_token_indices
+                and input_batch is not None
+                and hidden_states is not None
+            ):
+                for req_id, prior_index in zip(
+                    shard.prior_req_ids, shard.prior_token_indices
+                ):
+                    batch_index = req_id_to_batch_index[req_id]
+                    start = int(input_batch.query_start_loc_np[batch_index])
+                    computed = int(input_batch.num_computed_tokens_np[batch_index])
+                    local_pos = prior_index - computed
+                    hidden_index = start + local_pos
+                    meta = self.berag_child_by_req_id[req_id]
+                    prior_scores[meta.branch_id] = self._berag_prior_score(
+                        hidden_states[hidden_index].to(torch.bfloat16)
+                    )
+                self._berag_debug_shard(
+                    shard,
+                    "prior scores=%s",
+                    prior_scores,
+                )
+
+            sampled_token_id = None
+            sampled_logprobs: dict[int, float] | None = None
+            if logits is not None:
+                for req_id, branch_id, branch_row_id in zip(
+                    shard.req_ids, shard.branch_ids, shard.branch_row_ids
+                ):
+                    if req_id not in req_id_to_batch_index:
+                        continue
+                    batch_index = req_id_to_batch_index[req_id]
+                    branch_logprobs = logits[batch_index].log_softmax(
+                        dim=-1
+                    ).to(torch.bfloat16)
+                    self.berag_accumulator.workspace[branch_row_id].copy_(
+                        branch_logprobs
+                    )
+                    self.berag_accumulator.mark_live(branch_row_id)
+                    self._berag_debug_shard(
+                        shard,
+                        "wrote branch row branch=%d req=%s row=%d",
+                        branch_id,
+                        req_id,
+                        branch_row_id,
+                    )
+
+            if shard.is_final_shard and shard.sample_on_completion:
+                self._berag_debug_shard(
+                    shard,
+                    "mixing branch rows=%s log_posterior=%s",
+                    shard.branch_row_ids,
+                    shard.log_posterior,
+                )
+                branch_rows = self.berag_accumulator.workspace[
+                    torch.tensor(
+                        shard.branch_row_ids, dtype=torch.int64, device=self.device
+                    )
+                ]
+                log_weights = torch.tensor(
+                    shard.log_posterior,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                ).view(-1, 1)
+                mixture = torch.logsumexp(branch_rows + log_weights, dim=0).to(
+                    torch.bfloat16
+                )
+                self.berag_accumulator.workspace[shard.mixture_row_id].copy_(mixture)
+                self.berag_accumulator.mark_live(shard.mixture_row_id)
+                sampled_token_id = self._sample_berag_mixture(mixture, shard.req_ids[0])
+                sampled_logprobs = {}
+                for branch_id, row_id in zip(shard.branch_ids, shard.branch_row_ids):
+                    sampled_logprobs[branch_id] = float(
+                        self.berag_accumulator.workspace[row_id, sampled_token_id]
+                        .float()
+                        .cpu()
+                        .item()
+                    )
+                self._berag_debug_shard(
+                    shard,
+                    "sampled token=%s branch_logprobs=%s telemetry=%s",
+                    sampled_token_id,
+                    sampled_logprobs,
+                    self.berag_accumulator.telemetry(),
+                )
+
+            outputs.append(
+                BeragModelRunnerOutput(
+                    group_id=shard.group_id,
+                    step_id=shard.step_id,
+                    completed_branch_ids=shard.branch_ids,
+                    prior_scores=prior_scores or None,
+                    sampled_token_id=sampled_token_id,
+                    sampled_token_logprobs=sampled_logprobs,
+                )
+            )
+        return outputs
 
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
@@ -1113,8 +1449,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            self.apply_berag_worker_commands(scheduler_output)
             self.block_tables.apply_staged_writes()
+            if self._berag_debug_enabled(scheduler_output):
+                logger.info(
+                    "[BERAG debug] worker execute_model start scheduled_tokens=%d "
+                    "reqs=%s shards=%d",
+                    scheduler_output.total_num_scheduled_tokens,
+                    list(scheduler_output.num_scheduled_tokens),
+                    len(scheduler_output.scheduled_berag_shards or []),
+                )
             if scheduler_output.total_num_scheduled_tokens == 0:
+                if scheduler_output.scheduled_berag_shards:
+                    berag_outputs = self._process_berag_shards(
+                        scheduler_output, None, None
+                    )
+                    return self._make_empty_berag_output(
+                        scheduler_output, berag_outputs
+                    )
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
@@ -1253,6 +1605,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             del intermediate_tensors
 
         # Run model.
+        berag_debug = self._berag_debug_enabled(scheduler_output)
+        if berag_debug:
+            logger.info(
+                "[BERAG debug] worker forward start tokens=%d reqs=%s",
+                scheduler_output.total_num_scheduled_tokens,
+                list(scheduler_output.num_scheduled_tokens),
+            )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1290,6 +1649,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+        if berag_debug:
+            logger.info("[BERAG debug] worker forward done")
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1308,6 +1669,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
+            scheduler_output=scheduler_output,
             input_batch=input_batch,
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
@@ -1330,6 +1692,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The prior execute_model call must have failed.
             return None
 
+        scheduler_output = self.execute_model_state.scheduler_output
         input_batch = self.execute_model_state.input_batch
         attn_metadata = self.execute_model_state.attn_metadata
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
@@ -1355,6 +1718,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+
+        if scheduler_output.scheduled_berag_shards:
+            if self._berag_debug_enabled(scheduler_output):
+                logger.info(
+                    "[BERAG debug] worker BERAG sample_tokens start shards=%d",
+                    len(scheduler_output.scheduled_berag_shards),
+                )
+            assert hidden_states is not None
+            berag_outputs = self._process_berag_shards(
+                scheduler_output, input_batch, hidden_states
+            )
+            self.postprocess_num_computed_tokens(input_batch)
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            return ModelRunnerOutput(
+                req_ids=input_batch.req_ids,
+                req_id_to_index={
+                    req_id: i for i, req_id in enumerate(input_batch.req_ids)
+                },
+                sampled_token_ids=[],
+                kv_connector_output=kv_connector_output,
+                berag_outputs=berag_outputs,
+                berag_row_pool=self._berag_row_pool(),
+            )
 
         # Last rank: sample tokens
         sampler_output, num_sampled, num_rejected = self.sample(
@@ -1570,6 +1956,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
 
 class ExecuteModelState(NamedTuple):
+    scheduler_output: SchedulerOutput
     input_batch: InputBatch
     attn_metadata: dict[str, Any] | None
     slot_mappings_by_layer: dict[str, torch.Tensor] | None

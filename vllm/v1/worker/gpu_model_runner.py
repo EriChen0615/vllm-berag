@@ -21,6 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm.berag import BeragChildMetadata
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -112,6 +113,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
@@ -158,6 +160,8 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
+    BeragModelRunnerOutput,
+    BeragRowPoolTelemetry,
     DraftTokenIds,
     ECConnectorOutput,
     KVConnectorOutput,
@@ -236,6 +240,36 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+class BeragAccumulator:
+    def __init__(
+        self,
+        num_rows: int,
+        vocab_size: int,
+        device: torch.device,
+    ) -> None:
+        self.workspace = torch.empty(
+            (num_rows, vocab_size), dtype=torch.bfloat16, device=device
+        )
+        self.total_rows = num_rows
+        self.live_rows: set[int] = set()
+
+    def release(self, row_ids: list[int]) -> None:
+        for row_id in row_ids:
+            self.live_rows.discard(row_id)
+
+    def mark_live(self, row_id: int) -> None:
+        if row_id >= 0:
+            self.live_rows.add(row_id)
+
+    def telemetry(self) -> BeragRowPoolTelemetry:
+        live_rows = len(self.live_rows)
+        return BeragRowPoolTelemetry(
+            total_rows=self.total_rows,
+            free_rows=self.total_rows - live_rows,
+            live_rows=live_rows,
+        )
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -510,6 +544,17 @@ class GPUModelRunner(
             logprobs_mode=self.model_config.logprobs_mode,
             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
         )
+
+        self.berag_config = vllm_config.berag_config
+        self.berag_accumulator: BeragAccumulator | None = None
+        self.berag_prior_module: nn.Module | None = None
+        self.berag_child_by_req_id: dict[str, BeragChildMetadata] = {}
+        if self.berag_config.enabled:
+            self.berag_accumulator = BeragAccumulator(
+                self.berag_config.num_accumulator_rows,
+                self.model_config.get_vocab_size(),
+                self.device,
+            )
 
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
@@ -1124,6 +1169,285 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
+    def _load_berag_prior_module(self) -> None:
+        if not self.berag_config.enabled:
+            return
+        if not self.berag_config.prior_module_cls:
+            raise ValueError("BERAG requires prior_module_cls.")
+        if not self.berag_config.prior_module_weights_path:
+            raise ValueError("BERAG requires prior_module_weights_path.")
+        cls = resolve_obj_by_qualname(self.berag_config.prior_module_cls)
+        module = cls(**self.berag_config.prior_module_kwargs)
+        state = torch.load(
+            self.berag_config.prior_module_weights_path,
+            map_location=self.device,
+            weights_only=True,
+        )
+        module.load_state_dict(state)
+        module.to(device=self.device, dtype=torch.bfloat16)
+        module.eval()
+        self.berag_prior_module = module
+
+    def apply_berag_worker_commands(self, scheduler_output: "SchedulerOutput") -> None:
+        if self.berag_accumulator is not None and scheduler_output.berag_release_rows:
+            for release in scheduler_output.berag_release_rows:
+                self.berag_accumulator.release(release.row_ids)
+                if release.debug:
+                    logger.info(
+                        "[BERAG debug] worker-v1 group=%s step=%d release rows=%s "
+                        "telemetry=%s",
+                        release.group_id,
+                        release.step_id,
+                        release.row_ids,
+                        self.berag_accumulator.telemetry(),
+                    )
+
+        if not scheduler_output.berag_committed_tokens:
+            return
+        for command in scheduler_output.berag_committed_tokens:
+            if command.debug:
+                logger.info(
+                    "[BERAG debug] worker-v1 group=%s step=%d apply committed "
+                    "token=%d reqs=%s",
+                    command.group_id,
+                    command.step_id,
+                    command.token_id,
+                    command.req_ids,
+                )
+            for req_id in command.req_ids:
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    if command.debug:
+                        logger.info(
+                            "[BERAG debug] worker-v1 group=%s step=%d skip "
+                            "commit for missing req=%s",
+                            command.group_id,
+                            command.step_id,
+                            req_id,
+                        )
+                    continue
+                req_state.output_token_ids.append(command.token_id)
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is None:
+                    continue
+                token_index = self.input_batch.num_tokens_no_spec[req_index]
+                self.input_batch.token_ids_cpu[
+                    req_index, token_index : token_index + 1
+                ] = [command.token_id]
+                self.input_batch.is_token_ids[
+                    req_index, token_index : token_index + 1
+                ] = True
+                self.input_batch.num_tokens_no_spec[req_index] = token_index + 1
+
+    def _berag_row_pool(self) -> BeragRowPoolTelemetry | None:
+        if self.berag_accumulator is None:
+            return None
+        return self.berag_accumulator.telemetry()
+
+    @staticmethod
+    def _berag_debug_shard(shard: Any, message: str, *args: Any) -> None:
+        if not shard.debug:
+            return
+        logger.info(
+            "[BERAG debug] worker-v1 group=%s step=%d " + message,
+            shard.group_id,
+            shard.step_id,
+            *args,
+        )
+
+    @staticmethod
+    def _berag_debug_enabled(scheduler_output: "SchedulerOutput") -> bool:
+        return any(
+            shard.debug for shard in scheduler_output.scheduled_berag_shards or []
+        )
+
+    def _berag_prior_score(self, hidden_state: torch.Tensor) -> float:
+        assert self.berag_prior_module is not None
+        with torch.inference_mode():
+            score = self.berag_prior_module(hidden_state.unsqueeze(0))
+        return float(score.reshape(-1)[0].detach().float().cpu().item())
+
+    def _sample_berag_mixture(
+        self,
+        logprobs: torch.Tensor,
+        representative_req_id: str,
+    ) -> int:
+        req_state = self.requests[representative_req_id]
+        sampling_params = req_state.sampling_params
+        assert sampling_params is not None
+        logits = logprobs.float()
+        if sampling_params.temperature <= 1e-5:
+            return int(torch.argmax(logits).cpu().item())
+
+        logits = logits / sampling_params.temperature
+        probs = logits.softmax(dim=-1)
+        top_k = sampling_params.top_k
+        if top_k > 0 and top_k < probs.numel():
+            values, indices = torch.topk(probs, top_k)
+            filtered = torch.zeros_like(probs)
+            filtered.scatter_(0, indices, values)
+            probs = filtered
+        top_p = sampling_params.top_p
+        if top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative = sorted_probs.cumsum(dim=-1)
+            keep = cumulative <= top_p
+            keep[0] = True
+            filtered = torch.zeros_like(probs)
+            filtered.scatter_(0, sorted_indices[keep], sorted_probs[keep])
+            probs = filtered
+        probs = probs / probs.sum()
+        sampled = torch.multinomial(probs, 1, generator=req_state.generator)
+        return int(sampled.reshape(-1)[0].cpu().item())
+
+    def _process_berag_shards(
+        self,
+        scheduler_output: "SchedulerOutput",
+        logits: torch.Tensor | None,
+        hidden_states: torch.Tensor | None,
+    ) -> list[BeragModelRunnerOutput] | None:
+        shards = scheduler_output.scheduled_berag_shards
+        if not shards:
+            return None
+        assert self.berag_accumulator is not None
+        outputs: list[BeragModelRunnerOutput] = []
+        req_id_to_batch_index = {
+            req_id: index for index, req_id in enumerate(self.input_batch.req_ids)
+        }
+
+        for shard in shards:
+            if shard.mixture_row_id >= 0:
+                self.berag_accumulator.mark_live(shard.mixture_row_id)
+            self._berag_debug_shard(
+                shard,
+                "process shard reqs=%s branches=%s rows=%s mixture_row=%s "
+                "final=%s sample=%s prior_reqs=%s telemetry=%s",
+                shard.req_ids,
+                shard.branch_ids,
+                shard.branch_row_ids,
+                shard.mixture_row_id,
+                shard.is_final_shard,
+                shard.sample_on_completion,
+                shard.prior_req_ids,
+                self.berag_accumulator.telemetry(),
+            )
+
+            prior_scores: dict[int, float] = {}
+            if (
+                shard.prior_req_ids
+                and shard.prior_token_indices
+                and hidden_states is not None
+            ):
+                for req_id, prior_index in zip(
+                    shard.prior_req_ids, shard.prior_token_indices
+                ):
+                    batch_index = req_id_to_batch_index[req_id]
+                    start = int(self.query_start_loc.np[batch_index])
+                    computed = int(
+                        self.input_batch.num_computed_tokens_cpu[batch_index]
+                    )
+                    hidden_index = start + prior_index - computed
+                    meta = self.berag_child_by_req_id[req_id]
+                    prior_scores[meta.branch_id] = self._berag_prior_score(
+                        hidden_states[hidden_index].to(torch.bfloat16)
+                    )
+                self._berag_debug_shard(shard, "prior scores=%s", prior_scores)
+
+            sampled_token_id = None
+            sampled_logprobs: dict[int, float] | None = None
+            if logits is not None:
+                for req_id, branch_id, branch_row_id in zip(
+                    shard.req_ids, shard.branch_ids, shard.branch_row_ids
+                ):
+                    if req_id not in req_id_to_batch_index:
+                        continue
+                    batch_index = req_id_to_batch_index[req_id]
+                    branch_logprobs = logits[batch_index].log_softmax(
+                        dim=-1
+                    ).to(torch.bfloat16)
+                    self.berag_accumulator.workspace[branch_row_id].copy_(
+                        branch_logprobs
+                    )
+                    self.berag_accumulator.mark_live(branch_row_id)
+                    self._berag_debug_shard(
+                        shard,
+                        "wrote branch row branch=%d req=%s row=%d",
+                        branch_id,
+                        req_id,
+                        branch_row_id,
+                    )
+
+            if shard.is_final_shard and shard.sample_on_completion:
+                self._berag_debug_shard(
+                    shard,
+                    "mixing branch rows=%s log_posterior=%s",
+                    shard.branch_row_ids,
+                    shard.log_posterior,
+                )
+                branch_rows = self.berag_accumulator.workspace[
+                    torch.tensor(
+                        shard.branch_row_ids, dtype=torch.int64, device=self.device
+                    )
+                ]
+                log_weights = torch.tensor(
+                    shard.log_posterior,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                ).view(-1, 1)
+                mixture = torch.logsumexp(branch_rows + log_weights, dim=0).to(
+                    torch.bfloat16
+                )
+                self.berag_accumulator.workspace[shard.mixture_row_id].copy_(mixture)
+                self.berag_accumulator.mark_live(shard.mixture_row_id)
+                sampled_token_id = self._sample_berag_mixture(mixture, shard.req_ids[0])
+                sampled_logprobs = {}
+                for branch_id, row_id in zip(shard.branch_ids, shard.branch_row_ids):
+                    sampled_logprobs[branch_id] = float(
+                        self.berag_accumulator.workspace[row_id, sampled_token_id]
+                        .float()
+                        .cpu()
+                        .item()
+                    )
+                self._berag_debug_shard(
+                    shard,
+                    "sampled token=%s branch_logprobs=%s telemetry=%s",
+                    sampled_token_id,
+                    sampled_logprobs,
+                    self.berag_accumulator.telemetry(),
+                )
+
+            outputs.append(
+                BeragModelRunnerOutput(
+                    group_id=shard.group_id,
+                    step_id=shard.step_id,
+                    completed_branch_ids=shard.branch_ids,
+                    prior_scores=prior_scores or None,
+                    sampled_token_id=sampled_token_id,
+                    sampled_token_logprobs=sampled_logprobs,
+                )
+            )
+        return outputs
+
+    def _make_berag_output(
+        self,
+        *,
+        scheduler_output: "SchedulerOutput",
+        berag_outputs: list[BeragModelRunnerOutput] | None,
+        kv_connector_output: KVConnectorOutput | None = None,
+        ec_connector_output: ECConnectorOutput | None = None,
+        cudagraph_stats: CUDAGraphStat | None = None,
+    ) -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids.copy(),
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            sampled_token_ids=[],
+            kv_connector_output=kv_connector_output,
+            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+            cudagraph_stats=cudagraph_stats,
+            berag_outputs=berag_outputs,
+            berag_row_pool=self._berag_row_pool(),
+        )
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1138,6 +1462,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.berag_child_by_req_id.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1194,6 +1519,8 @@ class GPUModelRunner(
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            if new_req_data.berag_child is not None:
+                self.berag_child_by_req_id[req_id] = new_req_data.berag_child
             if req_id in self.requests:
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
@@ -4089,6 +4416,16 @@ class GPUModelRunner(
             assert kv_connector_metadata is not None
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
+        self.apply_berag_worker_commands(scheduler_output)
+        berag_debug = self._berag_debug_enabled(scheduler_output)
+        if berag_debug:
+            logger.info(
+                "[BERAG debug] worker-v1 execute_model start scheduled_tokens=%d "
+                "reqs=%s shards=%d",
+                scheduler_output.total_num_scheduled_tokens,
+                list(scheduler_output.num_scheduled_tokens),
+                len(scheduler_output.scheduled_berag_shards or []),
+            )
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
@@ -4120,7 +4457,27 @@ class GPUModelRunner(
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
+                    if scheduler_output.scheduled_berag_shards:
+                        berag_outputs = self._process_berag_shards(
+                            scheduler_output, None, None
+                        )
+                        return self._make_berag_output(
+                            scheduler_output=scheduler_output,
+                            berag_outputs=berag_outputs,
+                        )
                     return EMPTY_MODEL_RUNNER_OUTPUT
+                if scheduler_output.scheduled_berag_shards:
+                    berag_outputs = self._process_berag_shards(
+                        scheduler_output, None, None
+                    )
+                    kv_output = self.kv_connector_no_forward(
+                        scheduler_output, self.vllm_config
+                    )
+                    return self._make_berag_output(
+                        scheduler_output=scheduler_output,
+                        berag_outputs=berag_outputs,
+                        kv_connector_output=kv_output.kv_connector_output,
+                    )
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
             if self.cache_config.kv_sharing_fast_prefill:
@@ -4329,6 +4686,12 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if berag_debug:
+                logger.info(
+                    "[BERAG debug] worker-v1 forward start tokens=%d reqs=%s",
+                    scheduler_output.total_num_scheduled_tokens,
+                    list(scheduler_output.num_scheduled_tokens),
+                )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4336,6 +4699,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if berag_debug:
+                logger.info("[BERAG debug] worker-v1 forward done")
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4460,6 +4825,25 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        if scheduler_output.scheduled_berag_shards:
+            if self._berag_debug_enabled(scheduler_output):
+                logger.info(
+                    "[BERAG debug] worker-v1 BERAG sample_tokens start shards=%d",
+                    len(scheduler_output.scheduled_berag_shards),
+                )
+            berag_outputs = self._process_berag_shards(
+                scheduler_output, logits, hidden_states
+            )
+            kv_connector_output = self.kv_connector_output
+            self.kv_connector_output = None
+            return self._make_berag_output(
+                scheduler_output=scheduler_output,
+                berag_outputs=berag_outputs,
+                kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_connector_output,
+                cudagraph_stats=cudagraph_stats,
+            )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -5210,6 +5594,7 @@ class GPUModelRunner(
                         eplb_models += 1
 
                 self._setup_eagle3_aux_hidden_state_outputs()
+                self._load_berag_prior_module()
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the

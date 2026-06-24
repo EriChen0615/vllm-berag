@@ -21,6 +21,7 @@ import torch
 from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
+from vllm.config.berag import BeragConfig
 from vllm.logger import enable_trace_function_call, init_logger
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
@@ -322,6 +323,8 @@ class VllmConfig:
     """Speculative decoding configuration."""
     diffusion_config: DiffusionConfig | None = None
     """Diffusion LLM (dLLM) configuration."""
+    berag_config: BeragConfig = Field(default_factory=BeragConfig)
+    """BERAG configuration."""
 
     structured_outputs_config: StructuredOutputsConfig = Field(
         default_factory=StructuredOutputsConfig

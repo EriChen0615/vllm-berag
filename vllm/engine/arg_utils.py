@@ -35,6 +35,7 @@ from typing_extensions import TypeIs
 import vllm.envs as envs
 from vllm.config import (
     AttentionConfig,
+    BeragConfig,
     CacheConfig,
     CompilationConfig,
     ConfigType,
@@ -527,6 +528,15 @@ class EngineArgs:
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     max_num_seqs: int | None = None
+    berag_num_accumulator_rows: int = BeragConfig.num_accumulator_rows
+    berag_prior_module_cls: str | None = BeragConfig.prior_module_cls
+    berag_prior_module_weights_path: str | None = (
+        BeragConfig.prior_module_weights_path
+    )
+    berag_prior_module_kwargs: dict[str, Any] = get_field(
+        BeragConfig, "prior_module_kwargs"
+    )
+    berag_default_prior_token_offset: int = BeragConfig.default_prior_token_offset
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
     use_fp64_gumbel: bool = ModelConfig.use_fp64_gumbel
@@ -2327,6 +2337,13 @@ class EngineArgs:
             lora_config=lora_config,
             speculative_config=speculative_config,
             diffusion_config=diffusion_config,
+            berag_config=BeragConfig(
+                num_accumulator_rows=self.berag_num_accumulator_rows,
+                prior_module_cls=self.berag_prior_module_cls,
+                prior_module_weights_path=self.berag_prior_module_weights_path,
+                prior_module_kwargs=self.berag_prior_module_kwargs,
+                default_prior_token_offset=self.berag_default_prior_token_offset,
+            ),
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,
             compilation_config=compilation_config,

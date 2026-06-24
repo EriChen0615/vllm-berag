@@ -222,6 +222,25 @@ class KVConnectorOutput:
 
 
 @dataclass
+class BeragModelRunnerOutput:
+    group_id: str
+    step_id: int
+    completed_branch_ids: list[int]
+    prior_scores: dict[int, float] | None = None
+    sampled_token_id: int | None = None
+    sampled_token_logprobs: dict[int, float] | None = None
+    pruned_branch_ids: list[int] | None = None
+    logprobs: LogprobsLists | None = None
+
+
+@dataclass
+class BeragRowPoolTelemetry:
+    total_rows: int
+    free_rows: int
+    live_rows: int
+
+
+@dataclass
 class ECConnectorOutput:
     # [mm_hash]
     finished_sending: set[str] | None = None
@@ -279,6 +298,9 @@ class ModelRunnerOutput:
     # its slot buffer via ``slot_buffer[slot_mapping] = routing_data``.
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
+
+    berag_outputs: list[BeragModelRunnerOutput] | None = None
+    berag_row_pool: BeragRowPoolTelemetry | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

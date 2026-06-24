@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from tqdm.auto import tqdm
 from typing_extensions import overload
 
+from vllm.berag import BeragParams
 from vllm.config import (
     AttentionConfig,
     CompilationConfig,
@@ -47,7 +48,7 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.platforms import current_platform
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
@@ -483,6 +484,43 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             priority=priority,
             mm_processor_kwargs=mm_processor_kwargs,
         )
+
+    def generate_berag(
+        self,
+        shared_prefix: str,
+        documents: list[str],
+        suffix: str,
+        sampling_params: SamplingParams | None = None,
+        *,
+        berag_params: BeragParams | None = None,
+        request_id: str | None = None,
+        use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        debug: bool = False,
+    ) -> list[RequestOutput]:
+        """Generate with BERAG over a single retrieved-document list."""
+        runner_type = self.model_config.runner_type
+        if runner_type != "generate":
+            raise ValueError("LLM.generate_berag() requires a generative model.")
+
+        if sampling_params is None:
+            sampling_params = self.get_default_sampling_params()
+        sampling_params.output_kind = RequestOutputKind.FINAL_ONLY
+
+        parent_id = request_id or str(next(self.request_counter))
+        self.llm_engine.add_berag_request(
+            parent_id,
+            shared_prefix,
+            documents,
+            suffix,
+            sampling_params,
+            berag_params=berag_params,
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            debug=debug,
+        )
+        return self._run_engine(use_tqdm=use_tqdm, output_type=RequestOutput)
 
     def enqueue(
         self,

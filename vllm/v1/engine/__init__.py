@@ -11,6 +11,7 @@ import msgspec
 import numpy as np
 import torch
 
+from vllm.berag import BeragChildMetadata
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -129,6 +130,8 @@ class EngineCoreRequest(
 
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None
+
+    berag_child: BeragChildMetadata | None = None
 
     # If True, the request should be added to the scheduler's waiting queue
     # and immediately aborted, so connector-side cleanup runs via the standard

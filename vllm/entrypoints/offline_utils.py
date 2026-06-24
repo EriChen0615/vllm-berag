@@ -623,4 +623,7 @@ class OfflineInferenceMixin:
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
-        return sorted(outputs, key=lambda x: int(x.request_id))
+        try:
+            return sorted(outputs, key=lambda x: int(x.request_id))
+        except ValueError:
+            return sorted(outputs, key=lambda x: x.request_id)
