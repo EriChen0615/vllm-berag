@@ -12,4 +12,6 @@ export HF_HOME=/extra_data/vllm-berag/.cache/huggingface
 export HF_HUB_CACHE=/extra_data/vllm-berag/.cache/huggingface/hub
 export TRITON_CACHE_DIR=/extra_data/vllm-berag/.cache/triton
 
+export PATH=/extra_data/vllm-berag/.local/bin:$PATH
+
 source .venv/bin/activate

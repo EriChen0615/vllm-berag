@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+source my_scripts/activate_env.sh >/dev/null
+
+MODEL="${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
+DATA_DIR="${DATA_DIR:-my_outputs/data/NarrativeQA}"
+# K_VALUES="${K_VALUES:-50,75,100,150,200}"
+K_VALUES="${K_VALUES:-50,75}"
+MAX_EXAMPLES="${MAX_EXAMPLES:-512}"
+MAX_TOKENS="${MAX_TOKENS:-32}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
+DTYPE="${DTYPE:-auto}"
+NUM_ACCUMULATOR_ROWS="${NUM_ACCUMULATOR_ROWS:-1200}"
+PRUNING_TOP_P="${PRUNING_TOP_P:-1.0}"
+PRIOR_MODE="${PRIOR_MODE:-uniform}"
+DEFAULT_PRIOR_TOKEN_OFFSET="${DEFAULT_PRIOR_TOKEN_OFFSET:--4}"
+MODEL_SLUG="${MODEL_SLUG:-${MODEL//\//_}}"
+MODEL_SLUG="${MODEL_SLUG//:/_}"
+EXP_NAME="${EXP_NAME:-berag_${PRIOR_MODE}_${MODEL_SLUG}_TOPP-${PRUNING_TOP_P}_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-my_outputs/experiments/${EXP_NAME}}"
+
+echo "[berag] repo=$REPO_ROOT"
+echo "[berag] model=$MODEL"
+echo "[berag] data_dir=$DATA_DIR"
+echo "[berag] output_dir=$OUTPUT_DIR"
+echo "[berag] k_values=$K_VALUES"
+echo "[berag] max_examples=$MAX_EXAMPLES"
+echo "[berag] max_tokens=$MAX_TOKENS"
+echo "[berag] max_model_len=$MAX_MODEL_LEN"
+echo "[berag] gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
+echo "[berag] num_accumulator_rows=$NUM_ACCUMULATOR_ROWS"
+echo "[berag] pruning_top_p=$PRUNING_TOP_P"
+echo "[berag] prior_mode=$PRIOR_MODE"
+
+.venv/bin/python my_scripts/validate_narrativeqa_data.py \
+  --data-dir "$DATA_DIR" \
+  --k-values "$K_VALUES" \
+  --max-examples "$MAX_EXAMPLES"
+
+IFS=',' read -ra K_ARRAY <<< "$K_VALUES"
+for K_VALUE_RAW in "${K_ARRAY[@]}"; do
+  K_VALUE="${K_VALUE_RAW//[[:space:]]/}"
+  if [[ -z "$K_VALUE" ]]; then
+    continue
+  fi
+
+  RUN_NUM_ACCUMULATOR_ROWS="$NUM_ACCUMULATOR_ROWS"
+
+  cmd=(
+    .venv/bin/python my_scripts/benchmark_berag_narrativeqa.py
+    --model "$MODEL"
+    --data-dir "$DATA_DIR"
+    --output-dir "$OUTPUT_DIR"
+    --k-values "$K_VALUE"
+    --max-examples "$MAX_EXAMPLES"
+    --max-tokens "$MAX_TOKENS"
+    --max-model-len "$MAX_MODEL_LEN"
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+    --dtype "$DTYPE"
+    --num-accumulator-rows "$RUN_NUM_ACCUMULATOR_ROWS"
+    --pruning-top-p "$PRUNING_TOP_P"
+    --prior-mode "$PRIOR_MODE"
+    --default-prior-token-offset "$DEFAULT_PRIOR_TOKEN_OFFSET"
+    --trust-remote-code
+    # --enforce-eager
+  )
+
+  if [[ "$PRIOR_MODE" == "module" ]]; then
+    if [[ -n "${PRIOR_MODULE_CLS:-}" ]]; then
+      cmd+=(--prior-module-cls "$PRIOR_MODULE_CLS")
+    fi
+    if [[ -n "${PRIOR_MODULE_WEIGHTS_PATH:-}" ]]; then
+      cmd+=(--prior-module-weights-path "$PRIOR_MODULE_WEIGHTS_PATH")
+    fi
+    if [[ -n "${PRIOR_HIDDEN_SIZE:-}" ]]; then
+      cmd+=(--prior-hidden-size "$PRIOR_HIDDEN_SIZE")
+    fi
+  fi
+
+  if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
+    cmd+=(--max-num-seqs "$MAX_NUM_SEQS")
+  fi
+
+  if [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]]; then
+    cmd+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
+  fi
+
+  if [[ "${BERAG_LOG_GROUPS:-0}" == "1" ]]; then
+    cmd+=(
+      --berag-log-groups
+      --berag-group-trace-path "$OUTPUT_DIR/berag/k${K_VALUE}/group_trace.jsonl"
+    )
+  fi
+
+  if [[ "${BERAG_LOG_FULL_POSTERIOR:-0}" == "1" ]]; then
+    cmd+=(--berag-log-full-posterior)
+  fi
+
+  if [[ "${DISABLE_TQDM:-0}" == "1" ]]; then
+    cmd+=(--disable-tqdm)
+  fi
+
+  if [[ "${DEBUG:-0}" == "1" ]]; then
+    cmd+=(--debug)
+  fi
+
+  if [[ "${STOP_ON_ERROR:-0}" == "1" ]]; then
+    cmd+=(--stop-on-error)
+  fi
+
+  echo "[berag] starting k=$K_VALUE"
+  if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
+    echo "[berag] k=$K_VALUE max_num_seqs=$MAX_NUM_SEQS"
+  else
+    echo "[berag] k=$K_VALUE max_num_seqs=vllm-default"
+  fi
+  if [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]]; then
+    echo "[berag] k=$K_VALUE max_num_batched_tokens=$MAX_NUM_BATCHED_TOKENS"
+  else
+    echo "[berag] k=$K_VALUE max_num_batched_tokens=vllm-default"
+  fi
+  echo "[berag] k=$K_VALUE num_accumulator_rows=$RUN_NUM_ACCUMULATOR_ROWS"
+  "${cmd[@]}"
+done
+
+echo "[berag] done"
+echo "[berag] results: $OUTPUT_DIR/berag"

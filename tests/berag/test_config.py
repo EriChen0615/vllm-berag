@@ -13,6 +13,7 @@ from vllm.v1.engine.llm_engine import LLMEngine
 
 def make_fake_engine_config(
     *,
+    prior_mode: str = "module",
     prior_module_cls: str | None = "tests.berag.prior_fixtures.TinyPrior",
     prior_module_weights_path: str | None = "/tmp/prior.pt",
     tensor_parallel_size: int = 1,
@@ -23,6 +24,7 @@ def make_fake_engine_config(
 ):
     return SimpleNamespace(
         berag_config=BeragConfig(
+            prior_mode=prior_mode,
             prior_module_cls=prior_module_cls,
             prior_module_weights_path=prior_module_weights_path,
         ),
@@ -53,6 +55,15 @@ def validate(
 def test_berag_config_enabled_requires_prior_fields_for_validation():
     config = BeragConfig()
     assert not config.enabled
+    assert BeragConfig(prior_mode="uniform").enabled
+
+    validate(
+        make_fake_engine_config(
+            prior_mode="uniform",
+            prior_module_cls=None,
+            prior_module_weights_path=None,
+        )
+    )
 
     with pytest.raises(ValueError, match="prior_module_cls"):
         validate(make_fake_engine_config(prior_module_cls=None))

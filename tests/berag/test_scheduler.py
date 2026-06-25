@@ -10,6 +10,7 @@ import torch
 
 from vllm.berag import BeragChildMetadata
 from vllm.config import (
+    BeragConfig,
     CacheConfig,
     DeviceConfig,
     ModelConfig,
@@ -44,7 +45,7 @@ pytestmark = pytest.mark.cpu_test
 
 def make_local_opt_model(tmp_path: Path) -> str:
     model_dir = tmp_path / "tiny-opt"
-    model_dir.mkdir()
+    model_dir.mkdir(exist_ok=True)
     (model_dir / "config.json").write_text(
         json.dumps(
             {
@@ -69,6 +70,9 @@ def create_local_scheduler(
     max_num_batched_tokens: int = 8192,
     block_size: int = 16,
     num_blocks: int = 10000,
+    berag_prior_mode: str = "module",
+    berag_group_trace_path: str | None = None,
+    berag_group_trace_full_posterior: bool = False,
 ) -> Scheduler:
     model_config = ModelConfig(
         model=make_local_opt_model(tmp_path),
@@ -84,6 +88,7 @@ def create_local_scheduler(
         enable_chunked_prefill=True,
         is_encoder_decoder=model_config.is_encoder_decoder,
         watermark=0.0,
+        async_scheduling=False,
     )
     cache_config = CacheConfig(
         block_size=block_size,
@@ -97,6 +102,11 @@ def create_local_scheduler(
         cache_config=cache_config,
         parallel_config=ParallelConfig(),
         device_config=DeviceConfig(device="cpu"),
+        berag_config=BeragConfig(
+            prior_mode=berag_prior_mode,
+            group_trace_path=berag_group_trace_path,
+            group_trace_full_posterior=berag_group_trace_full_posterior,
+        ),
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -298,6 +308,122 @@ def test_berag_scheduler_defers_final_sampling_until_priors_arrive(tmp_path):
     assert finalize_shard.sample_on_completion
 
 
+def test_uniform_berag_prior_does_not_wait_for_worker_prior_scores(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path,
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        berag_prior_mode="uniform",
+    )
+    for request in [
+        make_berag_child_request(0, num_branches=2, pruning_top_p=1.0),
+        make_berag_child_request(1, num_branches=2, pruning_top_p=1.0),
+    ]:
+        scheduler.add_request(request)
+
+    group = scheduler.berag_groups["parent"]
+    assert group.prior_scores == {0: 0.0, 1: 0.0}
+    assert group.priors_ready
+
+    scheduler_output = scheduler.schedule()
+    shard = scheduler_output.scheduled_berag_shards[0]
+
+    assert shard.is_final_shard
+    assert shard.sample_on_completion
+    assert shard.log_posterior == pytest.approx([-math.log(2), -math.log(2)])
+
+    scheduler.update_from_output(
+        scheduler_output,
+        make_berag_model_output(
+            completed_branch_ids=[0, 1],
+            sampled_token_id=42,
+            sampled_token_logprobs={0: -0.1, 1: -2.0},
+        ),
+    )
+
+    assert not scheduler.berag_groups["parent"].pending_finalize
+
+
+def test_berag_group_trace_writes_compact_posterior(tmp_path):
+    trace_path = tmp_path / "group_trace.jsonl"
+    scheduler = create_local_scheduler(
+        tmp_path,
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        berag_prior_mode="uniform",
+        berag_group_trace_path=str(trace_path),
+    )
+    for request in [
+        make_berag_child_request(0, num_branches=2, pruning_top_p=1.0),
+        make_berag_child_request(1, num_branches=2, pruning_top_p=1.0),
+    ]:
+        scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduler_output,
+        make_berag_model_output(
+            completed_branch_ids=[0, 1],
+            sampled_token_id=42,
+            sampled_token_logprobs={0: -0.1, 1: -2.0},
+        ),
+    )
+
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    events = [row["event"] for row in rows]
+
+    assert "schedule_shard" in events
+    assert "receive_evidence" in events
+    assert "posterior_update" in events
+    assert "commit_token" in events
+
+    posterior_row = next(row for row in rows if row["event"] == "posterior_update")
+    assert posterior_row["posterior_top_branch_id"] == 0
+    assert posterior_row["posterior_top5"]
+    assert posterior_row["posterior_count"] == 2
+    assert "posterior_full" not in posterior_row
+
+
+def test_berag_group_trace_full_posterior_is_optional(tmp_path):
+    trace_path = tmp_path / "group_trace.jsonl"
+    scheduler = create_local_scheduler(
+        tmp_path,
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        berag_prior_mode="uniform",
+        berag_group_trace_path=str(trace_path),
+        berag_group_trace_full_posterior=True,
+    )
+    for request in [
+        make_berag_child_request(0, num_branches=2, pruning_top_p=1.0),
+        make_berag_child_request(1, num_branches=2, pruning_top_p=1.0),
+    ]:
+        scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduler_output,
+        make_berag_model_output(
+            completed_branch_ids=[0, 1],
+            sampled_token_id=42,
+            sampled_token_logprobs={0: -0.1, 1: -2.0},
+        ),
+    )
+
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    posterior_row = next(row for row in rows if row["event"] == "posterior_update")
+
+    assert set(posterior_row["posterior_full"]) == {"0", "1"}
+    assert sum(posterior_row["posterior_full"].values()) == pytest.approx(1.0)
+    assert posterior_row["sampled_token_logprobs"] == {"0": -0.1, "1": -2.0}
+
+
 def test_berag_final_shard_commits_parent_output_and_releases_rows(tmp_path):
     scheduler = create_local_scheduler(
         tmp_path, max_num_seqs=2, max_num_batched_tokens=4
@@ -334,6 +460,52 @@ def test_berag_final_shard_commits_parent_output_and_releases_rows(tmp_path):
     assert scheduler.berag_row_allocator.free_count == 400
     assert scheduler.berag_release_rows
     assert scheduler.berag_committed_tokens
+
+
+def test_berag_final_shard_updates_posterior_and_prunes_branch(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path, max_num_seqs=2, max_num_batched_tokens=4
+    )
+    requests = [
+        make_berag_child_request(0, num_branches=2, pruning_top_p=0.8),
+        make_berag_child_request(1, num_branches=2, pruning_top_p=0.8),
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduler_output,
+        make_berag_model_output(
+            completed_branch_ids=[0, 1],
+            prior_scores={0: 0.0, 1: 0.0},
+        ),
+    )
+    finalize_output = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        finalize_output,
+        make_berag_model_output(
+            completed_branch_ids=[0, 1],
+            sampled_token_id=42,
+            sampled_token_logprobs={0: -0.1, 1: -10.0},
+        ),
+    )
+
+    assert outputs[0].outputs[0].request_id == "parent"
+    group = scheduler.berag_groups["parent"]
+    assert group.step_id == 1
+    assert group.active_branch_ids == {0}
+    assert set(group.log_posterior) == {0}
+    assert group.log_posterior[0] == pytest.approx(0.0)
+
+    decode_output = scheduler.schedule()
+
+    assert decode_output.num_scheduled_tokens == {"parent:berag:0": 1}
+    assert decode_output.berag_committed_tokens[0].req_ids == [
+        "parent:berag:0",
+        "parent:berag:1",
+    ]
+    assert decode_output.berag_release_rows
 
 
 def test_berag_schedules_decode_after_first_shared_token(tmp_path):
@@ -375,3 +547,81 @@ def test_berag_schedules_decode_after_first_shared_token(tmp_path):
     }
     assert decode_output.scheduled_berag_shards
     assert decode_output.scheduled_berag_shards[0].sample_on_completion
+
+
+def test_berag_scheduler_rejects_mixing_ordinary_and_berag_requests(tmp_path):
+    scheduler = create_local_scheduler(tmp_path)
+
+    def make_ordinary_request() -> Request:
+        init_none_hash(sha256)
+        return Request(
+            request_id="ordinary",
+            prompt_token_ids=[1, 2],
+            sampling_params=SamplingParams(max_tokens=1),
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(16, sha256),
+        )
+
+    ordinary = make_ordinary_request()
+    scheduler.add_request(ordinary)
+    with pytest.raises(ValueError, match="mixed with ordinary"):
+        scheduler.add_request(make_berag_child_request(0, num_branches=1))
+
+    scheduler = create_local_scheduler(tmp_path)
+    scheduler.add_request(make_berag_child_request(0, num_branches=1))
+    with pytest.raises(ValueError, match="Ordinary requests"):
+        scheduler.add_request(make_ordinary_request())
+
+
+def test_berag_scheduler_rejects_worker_row_telemetry_mismatch(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path, max_num_seqs=2, max_num_batched_tokens=4
+    )
+    for request in [
+        make_berag_child_request(0, num_branches=2, pruning_top_p=1.0),
+        make_berag_child_request(1, num_branches=2, pruning_top_p=1.0),
+    ]:
+        scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+
+    with pytest.raises(RuntimeError, match="row telemetry mismatch"):
+        scheduler.update_from_output(
+            scheduler_output,
+            make_berag_model_output(
+                completed_branch_ids=[0, 1],
+                prior_scores={0: 0.0, 1: 0.0},
+                free_rows=400,
+                live_rows=0,
+            ),
+        )
+
+
+def test_berag_scheduler_ignores_stale_step_outputs(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path, max_num_seqs=2, max_num_batched_tokens=4
+    )
+    for request in [
+        make_berag_child_request(0, num_branches=2, pruning_top_p=1.0),
+        make_berag_child_request(1, num_branches=2, pruning_top_p=1.0),
+    ]:
+        scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    stale_output = make_berag_model_output(
+        completed_branch_ids=[0, 1],
+        prior_scores={0: 0.0, 1: 0.0},
+    )
+    stale_output.berag_outputs[0].step_id = 1
+    stale_output.berag_row_pool = BeragRowPoolTelemetry(
+        total_rows=400,
+        free_rows=scheduler.berag_row_allocator.free_count,
+        live_rows=400 - scheduler.berag_row_allocator.free_count,
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, stale_output)
+
+    assert all(not engine_outputs.outputs for engine_outputs in outputs.values())
+    group = scheduler.berag_groups["parent"]
+    assert group.prior_scores == {}
+    assert group.completed_branch_ids == set()

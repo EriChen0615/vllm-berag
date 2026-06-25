@@ -460,12 +460,13 @@ class LLMEngine:
         if not (0.0 < berag_params.pruning_top_p <= 1.0):
             raise ValueError("BeragParams.pruning_top_p must be in (0, 1].")
         berag_config = self.vllm_config.berag_config
-        if not berag_config.prior_module_cls or not (
-            berag_config.prior_module_weights_path
+        if berag_config.prior_mode == "module" and (
+            not berag_config.prior_module_cls
+            or not berag_config.prior_module_weights_path
         ):
             raise ValueError(
                 "BERAG requires berag_prior_module_cls and "
-                "berag_prior_module_weights_path."
+                "berag_prior_module_weights_path in module prior mode."
             )
         parallel_config = self.vllm_config.parallel_config
         if (

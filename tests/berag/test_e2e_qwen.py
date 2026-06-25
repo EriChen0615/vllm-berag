@@ -34,6 +34,7 @@ def test_generate_berag_qwen_smoke(tmp_path):
         gpu_memory_utilization=0.75,
         enforce_eager=True,
         async_scheduling=False,
+        disable_log_stats=False,
         berag_prior_module_cls="tests.berag.prior_fixtures.TinyPrior",
         berag_prior_module_weights_path=str(prior_path),
         berag_prior_module_kwargs={"hidden_size": 896},
@@ -56,3 +57,8 @@ def test_generate_berag_qwen_smoke(tmp_path):
     assert outputs[0].request_id == "0"
     assert outputs[0].finished
     assert outputs[0].outputs[0].token_ids
+    assert outputs[0].metrics is not None
+    assert outputs[0].metrics.queued_ts > 0
+    assert outputs[0].metrics.scheduled_ts > 0
+    assert outputs[0].metrics.first_token_ts > 0
+    assert outputs[0].metrics.first_token_ts >= outputs[0].metrics.scheduled_ts

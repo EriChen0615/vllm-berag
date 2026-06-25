@@ -214,6 +214,7 @@ cython_debug/
 
 # Results
 *.csv
+my_outputs/
 
 # Python pickle files
 *.pkl

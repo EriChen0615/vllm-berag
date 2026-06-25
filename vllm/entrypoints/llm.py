@@ -487,40 +487,191 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
     def generate_berag(
         self,
-        shared_prefix: str,
-        documents: list[str],
-        suffix: str,
-        sampling_params: SamplingParams | None = None,
+        shared_prefix: str | Sequence[str],
+        documents: Sequence[str] | Sequence[Sequence[str]],
+        suffix: str | Sequence[str],
+        sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
         *,
-        berag_params: BeragParams | None = None,
-        request_id: str | None = None,
+        berag_params: BeragParams | Sequence[BeragParams] | None = None,
+        request_id: str | Sequence[str] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
-        lora_request: LoRARequest | None = None,
+        lora_request: Sequence[LoRARequest | None] | LoRARequest | None = None,
+        priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         debug: bool = False,
     ) -> list[RequestOutput]:
-        """Generate with BERAG over a single retrieved-document list."""
+        """Generate with BERAG over one or more retrieved-document lists.
+
+        Args:
+            shared_prefix: Shared prompt prefix, or one prefix per BERAG parent.
+            documents: Retrieved documents for one BERAG parent, or one
+                document list per BERAG parent.
+            suffix: Shared prompt suffix, or one suffix per BERAG parent.
+            sampling_params: Sampling parameters. A single value is broadcast
+                to every BERAG parent; a sequence is paired one by one.
+            berag_params: BERAG parameters. A single value is broadcast to
+                every BERAG parent; a sequence is paired one by one.
+            request_id: Optional parent request ID, or one ID per BERAG parent.
+            use_tqdm: If `True`, shows a tqdm progress bar.
+            lora_request: LoRA request to use for generation, if any.
+            priority: Optional scheduler priority per BERAG parent.
+            tokenization_kwargs: Overrides for `tokenizer.encode`.
+            debug: Enables BERAG debug logging.
+
+        Returns:
+            Parent-only `RequestOutput` objects in the same order as the input
+            BERAG parents.
+        """
         runner_type = self.model_config.runner_type
         if runner_type != "generate":
             raise ValueError("LLM.generate_berag() requires a generative model.")
 
-        if sampling_params is None:
-            sampling_params = self.get_default_sampling_params()
-        sampling_params.output_kind = RequestOutputKind.FINAL_ONLY
+        def is_str_sequence(value: Any) -> bool:
+            return (
+                isinstance(value, Sequence)
+                and not isinstance(value, str)
+                and all(isinstance(item, str) for item in value)
+            )
 
-        parent_id = request_id or str(next(self.request_counter))
-        self.llm_engine.add_berag_request(
-            parent_id,
-            shared_prefix,
-            documents,
-            suffix,
-            sampling_params,
-            berag_params=berag_params,
-            lora_request=lora_request,
-            tokenization_kwargs=tokenization_kwargs,
-            debug=debug,
+        single_request = (
+            isinstance(shared_prefix, str)
+            and isinstance(suffix, str)
+            and is_str_sequence(documents)
         )
-        return self._run_engine(use_tqdm=use_tqdm, output_type=RequestOutput)
+
+        if single_request:
+            seq_prefixes = [shared_prefix]
+            seq_documents = [list(documents)]
+            seq_suffixes = [suffix]
+        else:
+            if isinstance(shared_prefix, str) or isinstance(suffix, str):
+                raise ValueError(
+                    "Batch BERAG requires shared_prefix, documents, and suffix "
+                    "to have one entry per parent request."
+                )
+            seq_prefixes = list(shared_prefix)
+            seq_suffixes = list(suffix)
+            seq_documents = []
+            for document_list in documents:
+                if isinstance(document_list, str):
+                    raise ValueError(
+                        "Batch BERAG documents must be a sequence of "
+                        "document sequences."
+                    )
+                seq_documents.append(list(document_list))
+
+        num_requests = len(seq_prefixes)
+        if num_requests == 0:
+            raise ValueError("LLM.generate_berag() requires at least one request.")
+        if len(seq_documents) != num_requests or len(seq_suffixes) != num_requests:
+            raise ValueError(
+                "The lengths of shared_prefix, documents, and suffix must match."
+            )
+        if not all(isinstance(prefix, str) for prefix in seq_prefixes):
+            raise TypeError("Every BERAG shared_prefix must be a string.")
+        if not all(isinstance(suffix_item, str) for suffix_item in seq_suffixes):
+            raise TypeError("Every BERAG suffix must be a string.")
+        if not all(is_str_sequence(document_list) for document_list in seq_documents):
+            raise TypeError("Every BERAG document must be a string.")
+
+        if sampling_params is None:
+            seq_sampling_params = [
+                self.get_default_sampling_params() for _ in range(num_requests)
+            ]
+        elif isinstance(sampling_params, SamplingParams):
+            seq_sampling_params = [sampling_params] * num_requests
+        else:
+            seq_sampling_params = list(sampling_params)
+            if len(seq_sampling_params) != num_requests:
+                raise ValueError(
+                    "The lengths of BERAG requests and sampling_params "
+                    "must be the same."
+                )
+        for params in seq_sampling_params:
+            params.output_kind = RequestOutputKind.FINAL_ONLY
+
+        if berag_params is None or isinstance(berag_params, BeragParams):
+            seq_berag_params = [berag_params] * num_requests
+        else:
+            seq_berag_params = list(berag_params)
+            if len(seq_berag_params) != num_requests:
+                raise ValueError(
+                    "The lengths of BERAG requests and berag_params "
+                    "must be the same."
+                )
+
+        if request_id is None:
+            parent_ids = [str(next(self.request_counter)) for _ in range(num_requests)]
+        elif isinstance(request_id, str):
+            if num_requests != 1:
+                raise ValueError(
+                    "Batch BERAG requires request_id to be a sequence, "
+                    "or omitted."
+                )
+            parent_ids = [request_id]
+        else:
+            parent_ids = list(request_id)
+            if len(parent_ids) != num_requests:
+                raise ValueError(
+                    "The lengths of BERAG requests and request_id "
+                    "must be the same."
+                )
+        if not all(isinstance(parent_id, str) for parent_id in parent_ids):
+            raise TypeError("Every BERAG request_id must be a string.")
+        if len(set(parent_ids)) != len(parent_ids):
+            raise ValueError("BERAG request_id values must be unique.")
+
+        if priority is not None:
+            if len(priority) != num_requests:
+                raise ValueError(
+                    "The lengths of BERAG requests and priority must be the same."
+                )
+            seq_priority = priority
+        else:
+            seq_priority = [0] * num_requests
+
+        if lora_request is None or isinstance(lora_request, LoRARequest):
+            seq_lora_requests = [lora_request] * num_requests
+        else:
+            seq_lora_requests = list(lora_request)
+            if len(seq_lora_requests) != num_requests:
+                raise ValueError(
+                    "The lengths of BERAG requests and lora_request "
+                    "must be the same."
+                )
+
+        added_parent_ids: list[str] = []
+        try:
+            for index, parent_id in enumerate(parent_ids):
+                self.llm_engine.add_berag_request(
+                    parent_id,
+                    seq_prefixes[index],
+                    seq_documents[index],
+                    seq_suffixes[index],
+                    seq_sampling_params[index],
+                    berag_params=seq_berag_params[index],
+                    lora_request=seq_lora_requests[index],
+                    tokenization_kwargs=tokenization_kwargs,
+                    priority=seq_priority[index],
+                    debug=debug,
+                )
+                added_parent_ids.append(parent_id)
+        except Exception as e:
+            if added_parent_ids:
+                self.llm_engine.abort_request(added_parent_ids, internal=True)
+            raise e
+
+        outputs = self._run_engine(use_tqdm=use_tqdm, output_type=RequestOutput)
+        parent_order = {
+            parent_id: index for index, parent_id in enumerate(added_parent_ids)
+        }
+        return sorted(
+            outputs,
+            key=lambda output: parent_order.get(
+                output.request_id,
+                len(parent_order),
+            ),
+        )
 
     def enqueue(
         self,

@@ -1172,6 +1172,8 @@ class GPUModelRunner(
     def _load_berag_prior_module(self) -> None:
         if not self.berag_config.enabled:
             return
+        if self.berag_config.prior_mode == "uniform":
+            return
         if not self.berag_config.prior_module_cls:
             raise ValueError("BERAG requires prior_module_cls.")
         if not self.berag_config.prior_module_weights_path:
@@ -1262,6 +1264,8 @@ class GPUModelRunner(
         )
 
     def _berag_prior_score(self, hidden_state: torch.Tensor) -> float:
+        if self.berag_config.prior_mode == "uniform":
+            return 0.0
         assert self.berag_prior_module is not None
         with torch.inference_mode():
             score = self.berag_prior_module(hidden_state.unsqueeze(0))
@@ -1355,12 +1359,13 @@ class GPUModelRunner(
 
             sampled_token_id = None
             sampled_logprobs: dict[int, float] | None = None
+            scheduled_branch_ids = shard.scheduled_branch_ids or shard.branch_ids
+            branch_row_by_id = dict(zip(shard.branch_ids, shard.branch_row_ids))
             if logits is not None:
-                for req_id, branch_id, branch_row_id in zip(
-                    shard.req_ids, shard.branch_ids, shard.branch_row_ids
-                ):
+                for req_id, branch_id in zip(shard.req_ids, scheduled_branch_ids):
                     if req_id not in req_id_to_batch_index:
                         continue
+                    branch_row_id = branch_row_by_id[branch_id]
                     batch_index = req_id_to_batch_index[req_id]
                     branch_logprobs = logits[batch_index].log_softmax(
                         dim=-1
@@ -1420,7 +1425,7 @@ class GPUModelRunner(
                 BeragModelRunnerOutput(
                     group_id=shard.group_id,
                     step_id=shard.step_id,
-                    completed_branch_ids=shard.branch_ids,
+                    completed_branch_ids=scheduled_branch_ids,
                     prior_scores=prior_scores or None,
                     sampled_token_id=sampled_token_id,
                     sampled_token_logprobs=sampled_logprobs,

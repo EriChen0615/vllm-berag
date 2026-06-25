@@ -192,6 +192,7 @@ class ScheduledBeragShard:
     log_posterior: list[float]
     is_final_shard: bool
     sample_on_completion: bool = True
+    scheduled_branch_ids: list[int] | None = None
     prior_req_ids: list[str] | None = None
     prior_token_indices: list[int] | None = None
     debug: bool = False
