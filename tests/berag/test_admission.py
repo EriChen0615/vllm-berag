@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Mapping
 from itertools import count
 
 import pytest
@@ -17,7 +18,8 @@ from vllm.v1.engine.llm_engine import LLMEngine
 class FakeInputProcessor:
 
     def __init__(self) -> None:
-        self.prompts: dict[str, str] = {}
+        self.prompts: dict[str, object] = {}
+        self.skip_mm_cache: dict[str, bool] = {}
 
     def process_inputs(
         self,
@@ -29,12 +31,15 @@ class FakeInputProcessor:
         lora_request=None,
         trace_headers=None,
         priority=0,
+        skip_mm_cache=False,
         **_,
     ):
         self.prompts[request_id] = prompt
+        self.skip_mm_cache[request_id] = skip_mm_cache
+        prompt_text = prompt["prompt"] if isinstance(prompt, Mapping) else prompt
         return EngineCoreRequest(
             request_id=request_id,
-            prompt_token_ids=list(range(len(prompt))),
+            prompt_token_ids=list(range(len(prompt_text))),
             mm_features=None,
             sampling_params=params,
             pooling_params=None,
@@ -112,6 +117,17 @@ class FakeLLMEngine:
     def _resolve_berag_prior_index(prompt_len: int, index: int) -> int:
         return LLMEngine._resolve_berag_prior_index(prompt_len, index)
 
+    @staticmethod
+    def _prepare_berag_shared_prefix(parent_request_id, shared_prefix):
+        return LLMEngine._prepare_berag_shared_prefix(
+            parent_request_id,
+            shared_prefix,
+        )
+
+    @staticmethod
+    def _berag_prompt_with_text(shared_prompt, text):
+        return LLMEngine._berag_prompt_with_text(shared_prompt, text)
+
 
 def make_fake_engine(*, max_model_len: int = 128):
     return FakeLLMEngine(max_model_len=max_model_len)
@@ -176,6 +192,79 @@ def test_add_berag_request_expands_parent_into_internal_children():
 
     assert child1.berag_child.branch_id == 1
     assert child1.berag_child.prior_token_index == 5
+
+
+def test_add_berag_request_reuses_shared_multimodal_prompt_fields():
+    engine = make_fake_engine()
+    image = object()
+    shared_prefix = {
+        "prompt": "<image> question: ",
+        "multi_modal_data": {"image": image},
+        "multi_modal_uuids": {"image": ["query-image"]},
+        "mm_processor_kwargs": {"do_resize": False},
+    }
+
+    LLMEngine.add_berag_request(
+        engine,
+        "parent",
+        shared_prefix,
+        ["doc-a ", "doc-b "],
+        " answer:",
+        SamplingParams(max_tokens=1),
+    )
+
+    parent_prompt = engine.input_processor.prompts["parent"]
+    child0_prompt = engine.input_processor.prompts["parent:berag:0"]
+    child1_prompt = engine.input_processor.prompts["parent:berag:1"]
+    assert isinstance(parent_prompt, dict)
+    assert isinstance(child0_prompt, dict)
+    assert isinstance(child1_prompt, dict)
+    assert parent_prompt["prompt"] == "<image> question:  answer:"
+    assert child0_prompt["prompt"] == "<image> question: doc-a  answer:"
+    assert child1_prompt["prompt"] == "<image> question: doc-b  answer:"
+    assert child0_prompt["multi_modal_data"] is parent_prompt["multi_modal_data"]
+    assert child1_prompt["multi_modal_data"] is parent_prompt["multi_modal_data"]
+    assert child0_prompt["multi_modal_uuids"] is parent_prompt["multi_modal_uuids"]
+    assert child1_prompt["multi_modal_uuids"] is parent_prompt["multi_modal_uuids"]
+    assert parent_prompt["multi_modal_uuids"] == {"image": ["query-image"]}
+    assert child0_prompt["mm_processor_kwargs"] == {"do_resize": False}
+    assert engine.input_processor.skip_mm_cache == {
+        "parent": True,
+        "parent:berag:0": False,
+        "parent:berag:1": False,
+    }
+
+
+def test_add_berag_request_generates_stable_shared_multimodal_uuids():
+    engine = make_fake_engine()
+    shared_prefix = {
+        "prompt": "<image><image> question: ",
+        "multi_modal_data": {"image": [object(), object()]},
+    }
+
+    LLMEngine.add_berag_request(
+        engine,
+        "parent",
+        shared_prefix,
+        ["doc-a ", "doc-b "],
+        " answer:",
+        SamplingParams(max_tokens=1),
+    )
+
+    parent_prompt = engine.input_processor.prompts["parent"]
+    child0_prompt = engine.input_processor.prompts["parent:berag:0"]
+    child1_prompt = engine.input_processor.prompts["parent:berag:1"]
+    assert isinstance(parent_prompt, dict)
+    assert isinstance(child0_prompt, dict)
+    assert isinstance(child1_prompt, dict)
+    assert parent_prompt["multi_modal_uuids"] == {
+        "image": [
+            "parent:berag:mm:image:0",
+            "parent:berag:mm:image:1",
+        ]
+    }
+    assert child0_prompt["multi_modal_uuids"] is parent_prompt["multi_modal_uuids"]
+    assert child1_prompt["multi_modal_uuids"] is parent_prompt["multi_modal_uuids"]
 
 
 def test_add_berag_request_cleans_up_parent_and_children_on_admission_failure():
@@ -252,6 +341,12 @@ class FakeOfflineEngine:
     def abort_request(self, request_ids, internal=False) -> None:
         self.aborted.append((request_ids, internal))
 
+    def reset_benchmark_scheduler_stats(self) -> None:
+        pass
+
+    def get_benchmark_scheduler_stats(self) -> dict:
+        return {}
+
 
 class FakeRequestOutput:
 
@@ -320,6 +415,33 @@ def test_generate_berag_uses_parent_request_id_and_final_only_sampling():
             "output_type": RequestOutput,
         }
     ]
+
+
+def test_generate_berag_accepts_multimodal_prompt_prefix():
+    llm = FakeOfflineLLM()
+    shared_prefix = {
+        "prompt": "<image> prefix ",
+        "multi_modal_data": {"image": object()},
+        "multi_modal_uuids": {"image": ["query-image"]},
+    }
+
+    outputs = LLM.generate_berag(
+        llm,
+        shared_prefix,
+        ["doc"],
+        " suffix",
+        SamplingParams(max_tokens=2),
+        request_id="req-1",
+        use_tqdm=False,
+    )
+
+    assert [output.request_id for output in outputs] == ["req-1"]
+    args, _ = llm.llm_engine.berag_calls[0]
+    assert args[0] == "req-1"
+    assert args[1] is shared_prefix
+    assert args[2] == ["doc"]
+    assert args[3] == " suffix"
+    assert isinstance(args[4], SamplingParams)
 
 
 def test_generate_berag_batches_parent_requests_before_engine_run():

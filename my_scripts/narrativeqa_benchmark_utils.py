@@ -30,6 +30,19 @@ LONG_BENCH_NARRATIVEQA_PROMPT = (
     "Question: {input}\n\n"
     "Answer:"
 )
+IMAGE_NARRATIVEQA_PROMPT = (
+    "You are given an image, a story, and a question.\n"
+    "First, describe the image in one concise sentence.\n"
+    "Then answer the question based on the story as concisely as you can, "
+    "using a single phrase if possible.\n"
+    "Answer in at most one sentence.\n\n"
+    "Response format:\n"
+    "Image: <one-sentence image description>\n"
+    "Answer: <short answer>\n\n"
+    "Story: {context}\n\n"
+    "Question: {input}\n\n"
+    "Image:"
+)
 
 DOCUMENT_ID_FIELDS = ("chunk_id", "id", "_id", "document_id")
 DOCUMENT_TEXT_FIELDS = ("text", "content", "document", "chunk", "passage", "context")
@@ -171,15 +184,36 @@ def make_longbench_prompt(context: str, question: str) -> str:
     return LONG_BENCH_NARRATIVEQA_PROMPT.format(context=context, input=question)
 
 
+def make_narrativeqa_prompt(
+    context: str,
+    question: str,
+    *,
+    include_image: bool = False,
+) -> str:
+    template = IMAGE_NARRATIVEQA_PROMPT if include_image else (
+        LONG_BENCH_NARRATIVEQA_PROMPT
+    )
+    return template.format(context=context, input=question)
+
+
 def render_qwen_chat_prompt(
     tokenizer: Any,
     user_prompt: str,
     *,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    include_image: bool = False,
 ) -> str:
+    user_content: str | list[dict[str, str]]
+    if include_image:
+        user_content = [
+            {"type": "image"},
+            {"type": "text", "text": user_prompt},
+        ]
+    else:
+        user_content = user_prompt
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": user_content},
     ]
     return tokenizer.apply_chat_template(
         messages,

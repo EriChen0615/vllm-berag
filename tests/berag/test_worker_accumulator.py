@@ -99,14 +99,44 @@ def make_final_subset_shard() -> ScheduledBeragShard:
     return ScheduledBeragShard(
         group_id="parent",
         step_id=1,
-        req_ids=["parent:berag:4"],
-        branch_ids=[0, 1, 2, 3, 4],
         mixture_row_id=0,
-        branch_row_ids=[1, 2, 3, 4, 5],
+        scheduled_req_ids=["parent:berag:4"],
+        scheduled_branch_ids=[4],
+        prior_req_ids=[],
+        prior_branch_ids=[],
+        prior_token_indices=[],
+        evidence_branch_ids=[4],
+        evidence_row_ids=[5],
+        mix_req_ids=[f"parent:berag:{branch_id}" for branch_id in range(5)],
+        mix_branch_ids=[0, 1, 2, 3, 4],
+        mix_row_ids=[1, 2, 3, 4, 5],
         log_posterior=[0.0, -1.0, -2.0, -3.0, -4.0],
         is_final_shard=True,
         sample_on_completion=True,
-        scheduled_branch_ids=[4],
+    )
+
+
+def make_direct_mix_shard(*, with_worker_priors: bool = False) -> ScheduledBeragShard:
+    return ScheduledBeragShard(
+        group_id="parent",
+        step_id=0,
+        mixture_row_id=-1,
+        scheduled_req_ids=["parent:berag:0", "parent:berag:1"],
+        scheduled_branch_ids=[0, 1],
+        prior_req_ids=["parent:berag:0", "parent:berag:1"]
+        if with_worker_priors
+        else [],
+        prior_branch_ids=[0, 1] if with_worker_priors else [],
+        prior_token_indices=[0, 0] if with_worker_priors else [],
+        evidence_branch_ids=[0, 1],
+        evidence_row_ids=[],
+        mix_req_ids=["parent:berag:0", "parent:berag:1"],
+        mix_branch_ids=[0, 1],
+        mix_row_ids=[],
+        log_posterior=[] if with_worker_priors else [0.0, -1.0],
+        is_final_shard=True,
+        direct_mix=True,
+        sample_on_completion=True,
     )
 
 
@@ -163,6 +193,70 @@ def test_v1_worker_processes_final_shard_with_scheduled_branch_subset_on_cpu():
     assert_final_subset_worker_output(accumulator, outputs[0])
 
 
+def test_v1_worker_direct_mix_samples_without_accumulator_on_cpu():
+    logits = torch.tensor([[0.0, 4.0, -2.0], [4.0, 0.0, -2.0]])
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.scheduled_berag_shards = [make_direct_mix_shard()]
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_ids=["parent:berag:0", "parent:berag:1"],
+        ),
+        berag_accumulator=None,
+        device=torch.device("cpu"),
+        _berag_debug_shard=lambda *args, **kwargs: None,
+        _sample_berag_mixture=lambda mixture, req_id: 1,
+    )
+
+    outputs = V1GPUModelRunner._process_berag_shards(
+        runner,
+        scheduler_output,
+        logits,
+        hidden_states=None,
+    )
+
+    expected = logits.log_softmax(dim=-1).to(torch.bfloat16)[:, 1].float()
+    assert outputs[0].completed_branch_ids == [0, 1]
+    assert outputs[0].sampled_token_id == 1
+    assert outputs[0].sampled_token_logprobs == pytest.approx(
+        {0: float(expected[0]), 1: float(expected[1])}
+    )
+
+
+def test_v1_worker_direct_mix_computes_priors_and_samples_on_cpu():
+    logits = torch.tensor([[0.0, 4.0, -2.0], [4.0, 0.0, -2.0]])
+    hidden_states = torch.tensor([[2.0, 0.0], [0.0, 1.0]])
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.scheduled_berag_shards = [
+        make_direct_mix_shard(with_worker_priors=True)
+    ]
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_ids=["parent:berag:0", "parent:berag:1"],
+            num_computed_tokens_cpu=[0, 0],
+        ),
+        query_start_loc=SimpleNamespace(np=[0, 1]),
+        berag_child_by_req_id={
+            "parent:berag:0": SimpleNamespace(branch_id=0),
+            "parent:berag:1": SimpleNamespace(branch_id=1),
+        },
+        berag_accumulator=None,
+        device=torch.device("cpu"),
+        _berag_prior_score=lambda hidden: float(hidden[0].float().item()),
+        _berag_debug_shard=lambda *args, **kwargs: None,
+        _sample_berag_mixture=lambda mixture, req_id: 1,
+    )
+
+    outputs = V1GPUModelRunner._process_berag_shards(
+        runner,
+        scheduler_output,
+        logits,
+        hidden_states=hidden_states,
+    )
+
+    assert outputs[0].prior_scores == {0: 2.0, 1: 0.0}
+    assert outputs[0].sampled_token_id == 1
+
+
 def test_v2_worker_processes_final_shard_with_scheduled_branch_subset_on_cpu():
     accumulator = V2BeragAccumulator(6, 3, torch.device("cpu"))
     seed_branch_rows(accumulator)
@@ -191,3 +285,71 @@ def test_v2_worker_processes_final_shard_with_scheduled_branch_subset_on_cpu():
     )
 
     assert_final_subset_worker_output(accumulator, outputs[0])
+
+
+def test_v2_worker_direct_mix_samples_without_accumulator_on_cpu():
+    logits = torch.tensor([[0.0, 4.0, -2.0], [4.0, 0.0, -2.0]])
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.scheduled_berag_shards = [make_direct_mix_shard()]
+    input_batch = SimpleNamespace(
+        req_ids=["parent:berag:0", "parent:berag:1"],
+        logits_indices=torch.tensor([0, 1]),
+    )
+    runner = SimpleNamespace(
+        model=SimpleNamespace(compute_logits=lambda hidden_states: logits),
+        berag_accumulator=None,
+        device=torch.device("cpu"),
+        _berag_debug_shard=lambda *args, **kwargs: None,
+        _sample_berag_mixture=lambda mixture, req_id: 1,
+    )
+
+    outputs = V2GPUModelRunner._process_berag_shards(
+        runner,
+        scheduler_output,
+        input_batch,
+        hidden_states=torch.zeros((2, 2)),
+    )
+
+    expected = logits.log_softmax(dim=-1).to(torch.bfloat16)[:, 1].float()
+    assert outputs[0].completed_branch_ids == [0, 1]
+    assert outputs[0].sampled_token_id == 1
+    assert outputs[0].sampled_token_logprobs == pytest.approx(
+        {0: float(expected[0]), 1: float(expected[1])}
+    )
+
+
+def test_v2_worker_direct_mix_computes_priors_and_samples_on_cpu():
+    logits = torch.tensor([[0.0, 4.0, -2.0], [4.0, 0.0, -2.0]])
+    hidden_states = torch.tensor([[2.0, 0.0], [0.0, 1.0]])
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.scheduled_berag_shards = [
+        make_direct_mix_shard(with_worker_priors=True)
+    ]
+    input_batch = SimpleNamespace(
+        req_ids=["parent:berag:0", "parent:berag:1"],
+        logits_indices=torch.tensor([0, 1]),
+        query_start_loc_np=[0, 1],
+        num_computed_tokens_np=[0, 0],
+    )
+    runner = SimpleNamespace(
+        model=SimpleNamespace(compute_logits=lambda sample_hidden_states: logits),
+        berag_child_by_req_id={
+            "parent:berag:0": SimpleNamespace(branch_id=0),
+            "parent:berag:1": SimpleNamespace(branch_id=1),
+        },
+        berag_accumulator=None,
+        device=torch.device("cpu"),
+        _berag_prior_score=lambda hidden: float(hidden[0].float().item()),
+        _berag_debug_shard=lambda *args, **kwargs: None,
+        _sample_berag_mixture=lambda mixture, req_id: 1,
+    )
+
+    outputs = V2GPUModelRunner._process_berag_shards(
+        runner,
+        scheduler_output,
+        input_batch,
+        hidden_states=hidden_states,
+    )
+
+    assert outputs[0].prior_scores == {0: 2.0, 1: 0.0}
+    assert outputs[0].sampled_token_id == 1

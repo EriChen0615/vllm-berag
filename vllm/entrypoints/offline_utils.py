@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -337,6 +338,9 @@ class OfflineInferenceMixin:
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ):
+        timing_start = time.perf_counter()
+        self.llm_engine.reset_benchmark_scheduler_stats()
+        add_start = time.perf_counter()
         self._add_completion_requests(
             prompts=prompts,
             params=params,
@@ -346,7 +350,17 @@ class OfflineInferenceMixin:
             tokenization_kwargs=tokenization_kwargs,
             mm_processor_kwargs=mm_processor_kwargs,
         )
-        return self._run_engine(use_tqdm=use_tqdm, output_type=output_type)
+        add_end = time.perf_counter()
+        run_start = time.perf_counter()
+        outputs = self._run_engine(use_tqdm=use_tqdm, output_type=output_type)
+        run_end = time.perf_counter()
+        self._last_generate_timing = {
+            "total_s": run_end - timing_start,
+            "add_requests_s": add_end - add_start,
+            "run_engine_s": run_end - run_start,
+            "scheduler_stats": self.llm_engine.get_benchmark_scheduler_stats(),
+        }
+        return outputs
 
     def _run_chat(
         self,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import sys
@@ -22,7 +23,7 @@ from my_scripts.narrativeqa_benchmark_utils import (  # noqa: E402
     aggregate_prediction_metrics,
     build_prediction_row,
     length_summary,
-    make_longbench_prompt,
+    make_narrativeqa_prompt,
     make_standard_rag_context,
     parse_k_values,
     read_jsonl,
@@ -62,6 +63,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", default="my_outputs/data/NarrativeQA")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-examples", type=int, default=2)
+    parser.add_argument(
+        "--request-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of parent BERAG requests per generate_berag call. "
+            "Use 1 to benchmark batch-size-one execution over many examples."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -87,6 +97,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--berag-log-groups", action="store_true")
     parser.add_argument("--berag-log-full-posterior", action="store_true")
     parser.add_argument("--berag-group-trace-path", default=None)
+    parser.add_argument("--query-image-path", default=None)
+    parser.add_argument("--query-image-uuid", default="narrativeqa-shared-query-image")
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
@@ -206,12 +218,50 @@ def make_berag_params(args: argparse.Namespace) -> Any:
     return BeragParams(pruning_top_p=args.pruning_top_p)
 
 
-def split_berag_prompt(tokenizer: Any, question: str) -> tuple[str, str]:
-    user_prompt = make_longbench_prompt(BERAG_CONTEXT_SENTINEL, question)
+def load_query_image(args: argparse.Namespace) -> Any | None:
+    if args.query_image_path is None:
+        return None
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required for --query-image-path.") from exc
+    image_path = Path(args.query_image_path)
+    if not image_path.exists():
+        raise FileNotFoundError(f"Missing query image: {image_path}")
+    with Image.open(image_path) as image:
+        return image.convert("RGB")
+
+
+def make_shared_prefix_prompt(
+    shared_prefix: str,
+    query_image: Any | None,
+    query_image_uuid: str,
+) -> str | dict[str, Any]:
+    if query_image is None:
+        return shared_prefix
+    return {
+        "prompt": shared_prefix,
+        "multi_modal_data": {"image": query_image},
+        "multi_modal_uuids": {"image": [query_image_uuid]},
+    }
+
+
+def split_berag_prompt(
+    tokenizer: Any,
+    question: str,
+    *,
+    include_image: bool = False,
+) -> tuple[str, str]:
+    user_prompt = make_narrativeqa_prompt(
+        BERAG_CONTEXT_SENTINEL,
+        question,
+        include_image=include_image,
+    )
     rendered = render_qwen_chat_prompt(
         tokenizer,
         user_prompt,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
+        include_image=include_image,
     )
     parts = rendered.split(BERAG_CONTEXT_SENTINEL)
     if len(parts) != 2:
@@ -226,13 +276,23 @@ def make_branch_documents(chunks: list[str]) -> list[str]:
     ]
 
 
-def logical_prompt_tokens(tokenizer: Any, row: dict[str, Any]) -> int:
+def logical_prompt_tokens(
+    tokenizer: Any,
+    row: dict[str, Any],
+    *,
+    include_image: bool = False,
+) -> int:
     context = make_standard_rag_context(row["chunks"])
-    user_prompt = make_longbench_prompt(context, row["question"])
+    user_prompt = make_narrativeqa_prompt(
+        context,
+        row["question"],
+        include_image=include_image,
+    )
     rendered = render_qwen_chat_prompt(
         tokenizer,
         user_prompt,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
+        include_image=include_image,
     )
     return len(tokenizer.encode(rendered, add_special_tokens=False))
 
@@ -304,6 +364,7 @@ def write_run_config(
             "k": k_value,
             "num_examples": len(rows),
             "max_examples": args.max_examples,
+            "request_batch_size": args.request_batch_size,
             "max_tokens": args.max_tokens,
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -322,6 +383,8 @@ def write_run_config(
                 args.prior_module_weights_path,
             ),
             "default_prior_token_offset": args.default_prior_token_offset,
+            "query_image_path": args.query_image_path,
+            "query_image_uuid": args.query_image_uuid,
             "berag_group_trace_path": getattr(
                 args,
                 "resolved_berag_group_trace_path",
@@ -359,6 +422,69 @@ def write_failed_metrics(
     )
 
 
+def _merge_scheduler_stats(
+    totals: dict[str, float],
+    scheduler_stats: dict[str, Any],
+) -> None:
+    for key, value in scheduler_stats.items():
+        if not isinstance(value, (int, float)):
+            continue
+        numeric_value = float(value)
+        if key in {
+            "gpu_kv_cache_usage_peak",
+            "gpu_kv_cache_usage_peak_pct",
+        }:
+            totals[key] = max(totals.get(key, 0.0), numeric_value)
+        elif key in {
+            "gpu_kv_cache_usage_final",
+            "gpu_kv_cache_usage_final_pct",
+        }:
+            totals[key] = numeric_value
+        elif key.endswith("_hit_rate") or key.endswith("_hit_rate_pct"):
+            continue
+        else:
+            totals[key] = totals.get(key, 0.0) + numeric_value
+
+
+def _finalize_scheduler_stats(totals: dict[str, float]) -> dict[str, float]:
+    stats = dict(totals)
+    prefix_queries = stats.get("prefix_cache_queries", 0.0)
+    prefix_hits = stats.get("prefix_cache_hits", 0.0)
+    connector_queries = stats.get("connector_prefix_cache_queries", 0.0)
+    connector_hits = stats.get("connector_prefix_cache_hits", 0.0)
+    stats["prefix_cache_hit_rate"] = (
+        prefix_hits / prefix_queries if prefix_queries > 0 else 0.0
+    )
+    stats["prefix_cache_hit_rate_pct"] = stats["prefix_cache_hit_rate"] * 100
+    stats["connector_prefix_cache_hit_rate"] = (
+        connector_hits / connector_queries if connector_queries > 0 else 0.0
+    )
+    stats["connector_prefix_cache_hit_rate_pct"] = (
+        stats["connector_prefix_cache_hit_rate"] * 100
+    )
+    return stats
+
+
+def _merge_berag_timing(
+    totals: dict[str, float],
+    scheduler_totals: dict[str, float],
+    timing: dict[str, Any],
+) -> None:
+    for key in (
+        "total_s",
+        "admission_s",
+        "run_engine_s",
+        "num_parent_requests",
+        "num_child_requests",
+    ):
+        value = timing.get(key)
+        if isinstance(value, (int, float)):
+            totals[key] = totals.get(key, 0.0) + float(value)
+    scheduler_stats = timing.get("scheduler_stats") or {}
+    if isinstance(scheduler_stats, dict):
+        _merge_scheduler_stats(scheduler_totals, scheduler_stats)
+
+
 def run_one_k(
     *,
     args: argparse.Namespace,
@@ -366,34 +492,53 @@ def run_one_k(
     tokenizer: Any,
     sampling_params: Any,
     berag_params: Any,
+    query_image: Any | None,
     k_value: int,
     rows: list[dict[str, Any]],
 ) -> None:
     k_dir = Path(args.output_dir) / "berag" / f"k{k_value}"
     k_dir.mkdir(parents=True, exist_ok=True)
 
-    shared_prefixes: list[str] = []
+    shared_prefixes: list[str | dict[str, Any]] = []
     document_lists: list[list[str]] = []
     suffixes: list[str] = []
     request_ids: list[str] = []
     logical_prompt_lengths: list[int] = []
     branch_prompt_totals: list[int] = []
 
+    prepare_start = time.perf_counter()
     for row in rows:
-        shared_prefix, suffix = split_berag_prompt(tokenizer, row["question"])
+        shared_prefix_text, suffix = split_berag_prompt(
+            tokenizer,
+            row["question"],
+            include_image=query_image is not None,
+        )
         documents = make_branch_documents(row["chunks"])
         branch_lengths = branch_prompt_token_lengths(
             tokenizer,
-            shared_prefix,
+            shared_prefix_text,
             documents,
             suffix,
         )
-        shared_prefixes.append(shared_prefix)
+        shared_prefixes.append(
+            make_shared_prefix_prompt(
+                shared_prefix_text,
+                query_image,
+                args.query_image_uuid,
+            )
+        )
         document_lists.append(documents)
         suffixes.append(suffix)
         request_ids.append(f"{row['example_id']}:berag")
-        logical_prompt_lengths.append(logical_prompt_tokens(tokenizer, row))
+        logical_prompt_lengths.append(
+            logical_prompt_tokens(
+                tokenizer,
+                row,
+                include_image=query_image is not None,
+            )
+        )
         branch_prompt_totals.append(sum(branch_lengths))
+    prepare_s = time.perf_counter() - prepare_start
 
     write_run_config(
         output_path=k_dir / "run_config.json",
@@ -406,16 +551,29 @@ def run_one_k(
 
     start = time.perf_counter()
     try:
-        outputs = llm.generate_berag(
-            shared_prefix=shared_prefixes,
-            documents=document_lists,
-            suffix=suffixes,
-            sampling_params=sampling_params,
-            berag_params=berag_params,
-            request_id=request_ids,
-            debug=args.debug,
-            use_tqdm=not args.disable_tqdm,
-        )
+        outputs = []
+        timing_totals: dict[str, float] = {}
+        scheduler_totals: dict[str, float] = {}
+        batch_size = args.request_batch_size or len(rows)
+        for batch_start in range(0, len(rows), batch_size):
+            batch_end = min(batch_start + batch_size, len(rows))
+            outputs.extend(
+                llm.generate_berag(
+                    shared_prefix=shared_prefixes[batch_start:batch_end],
+                    documents=document_lists[batch_start:batch_end],
+                    suffix=suffixes[batch_start:batch_end],
+                    sampling_params=sampling_params,
+                    berag_params=berag_params,
+                    request_id=request_ids[batch_start:batch_end],
+                    debug=args.debug,
+                    use_tqdm=not args.disable_tqdm,
+                )
+            )
+            _merge_berag_timing(
+                timing_totals,
+                scheduler_totals,
+                getattr(llm, "_last_berag_timing", {}),
+            )
         wall_time_s = time.perf_counter() - start
         if len(outputs) != len(rows):
             raise RuntimeError(
@@ -432,17 +590,22 @@ def run_one_k(
         )
         if args.stop_on_error:
             raise
-        print(f"[berag] k={k_value} failed; metrics saved")
-        return
+            print(f"[berag] k={k_value} failed; metrics saved")
+            return
 
     prediction_rows: list[dict[str, Any]] = []
     for index, (row, output) in enumerate(zip(rows, outputs)):
         try:
             if output.metrics is None:
                 raise RuntimeError("BERAG parent RequestOutput.metrics is None.")
+            shared_prefix_text = (
+                shared_prefixes[index]["prompt"]
+                if isinstance(shared_prefixes[index], dict)
+                else shared_prefixes[index]
+            )
             branch_lengths = branch_prompt_token_lengths(
                 tokenizer,
-                shared_prefixes[index],
+                shared_prefix_text,
                 document_lists[index],
                 suffixes[index],
             )
@@ -487,10 +650,22 @@ def run_one_k(
         return
 
     metrics = aggregate_prediction_metrics(prediction_rows, wall_time_s=wall_time_s)
+    scheduler_stats = _finalize_scheduler_stats(scheduler_totals)
     metrics.update(
         {
             "status": "ok",
             "k": k_value,
+            "prepare_s": prepare_s,
+            "request_batch_size": args.request_batch_size,
+            "num_request_batches": math.ceil(len(rows) / batch_size),
+            "generate_total_s": timing_totals.get("total_s", wall_time_s),
+            "berag_admission_s": timing_totals.get("admission_s"),
+            "berag_run_engine_s": timing_totals.get("run_engine_s"),
+            "berag_num_parent_requests": timing_totals.get(
+                "num_parent_requests"
+            ),
+            "berag_num_child_requests": timing_totals.get("num_child_requests"),
+            **scheduler_stats,
             "mean_branch_prompt_tokens_total": (
                 sum(branch_prompt_totals) / len(branch_prompt_totals)
                 if branch_prompt_totals
@@ -500,8 +675,17 @@ def run_one_k(
     )
     write_jsonl(k_dir / "predictions.jsonl", prediction_rows)
     write_json(k_dir / "metrics.json", metrics)
+    admission_s = metrics["berag_admission_s"] or 0.0
+    run_engine_s = metrics["berag_run_engine_s"] or 0.0
+    kv_peak_pct = metrics.get("gpu_kv_cache_usage_peak_pct", 0.0)
+    prefix_hit_pct = metrics.get("prefix_cache_hit_rate_pct", 0.0)
     print(
         f"[berag] k={k_value} requests={len(rows)} wall_time={wall_time_s:.2f}s "
+        f"prepare={prepare_s:.2f}s "
+        f"admission={admission_s:.2f}s "
+        f"run_engine={run_engine_s:.2f}s "
+        f"kv_peak={kv_peak_pct:.1f}% "
+        f"prefix_hit={prefix_hit_pct:.1f}% "
         f"rps={metrics['requests_per_second']:.4f} "
         f"mean_input_tokens={metrics['mean_input_tokens']:.1f} "
         f"p90_ttft={metrics['p90_ttft_s']:.4f}s "
@@ -513,6 +697,8 @@ def run_one_k(
 def main() -> None:
     set_cache_env()
     args = parse_args()
+    if args.request_batch_size is not None and args.request_batch_size <= 0:
+        raise ValueError("--request-batch-size must be positive when set.")
     k_values = parse_k_values(args.k_values)
     data_dir = Path(args.data_dir)
     output_dir = Path(args.output_dir)
@@ -528,6 +714,7 @@ def main() -> None:
     llm = make_llm(args, prior_path)
     sampling_params = make_sampling_params(args)
     berag_params = make_berag_params(args)
+    query_image = load_query_image(args)
 
     for k_value in k_values:
         rows = load_k_rows(data_dir, k_value, args.max_examples)
@@ -537,6 +724,7 @@ def main() -> None:
             tokenizer=tokenizer,
             sampling_params=sampling_params,
             berag_params=berag_params,
+            query_image=query_image,
             k_value=k_value,
             rows=rows,
         )

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -487,7 +488,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
     def generate_berag(
         self,
-        shared_prefix: str | Sequence[str],
+        shared_prefix: str | PromptType | Sequence[str | PromptType],
         documents: Sequence[str] | Sequence[Sequence[str]],
         suffix: str | Sequence[str],
         sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
@@ -522,6 +523,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             Parent-only `RequestOutput` objects in the same order as the input
             BERAG parents.
         """
+        timing_start = time.perf_counter()
         runner_type = self.model_config.runner_type
         if runner_type != "generate":
             raise ValueError("LLM.generate_berag() requires a generative model.")
@@ -530,11 +532,18 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             return (
                 isinstance(value, Sequence)
                 and not isinstance(value, str)
+                and not isinstance(value, (bytes, bytearray))
                 and all(isinstance(item, str) for item in value)
             )
 
+        def is_text_prompt(value: Any) -> bool:
+            return isinstance(value, str) or (
+                isinstance(value, Mapping)
+                and isinstance(value.get("prompt"), str)
+            )
+
         single_request = (
-            isinstance(shared_prefix, str)
+            is_text_prompt(shared_prefix)
             and isinstance(suffix, str)
             and is_str_sequence(documents)
         )
@@ -548,6 +557,14 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
                 raise ValueError(
                     "Batch BERAG requires shared_prefix, documents, and suffix "
                     "to have one entry per parent request."
+                )
+            if isinstance(shared_prefix, Mapping) or not isinstance(
+                shared_prefix,
+                Sequence,
+            ):
+                raise TypeError(
+                    "Batch BERAG shared_prefix must be a sequence of strings "
+                    "or text PromptType dictionaries."
                 )
             seq_prefixes = list(shared_prefix)
             seq_suffixes = list(suffix)
@@ -567,8 +584,11 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             raise ValueError(
                 "The lengths of shared_prefix, documents, and suffix must match."
             )
-        if not all(isinstance(prefix, str) for prefix in seq_prefixes):
-            raise TypeError("Every BERAG shared_prefix must be a string.")
+        if not all(is_text_prompt(prefix) for prefix in seq_prefixes):
+            raise TypeError(
+                "Every BERAG shared_prefix must be a string or a text "
+                "PromptType dictionary with a string 'prompt' field."
+            )
         if not all(isinstance(suffix_item, str) for suffix_item in seq_suffixes):
             raise TypeError("Every BERAG suffix must be a string.")
         if not all(is_str_sequence(document_list) for document_list in seq_documents):
@@ -641,6 +661,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
                 )
 
         added_parent_ids: list[str] = []
+        self.llm_engine.reset_benchmark_scheduler_stats()
+        admission_start = time.perf_counter()
         try:
             for index, parent_id in enumerate(parent_ids):
                 self.llm_engine.add_berag_request(
@@ -660,8 +682,19 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             if added_parent_ids:
                 self.llm_engine.abort_request(added_parent_ids, internal=True)
             raise e
+        admission_end = time.perf_counter()
 
+        run_engine_start = time.perf_counter()
         outputs = self._run_engine(use_tqdm=use_tqdm, output_type=RequestOutput)
+        run_engine_end = time.perf_counter()
+        self._last_berag_timing = {
+            "total_s": run_engine_end - timing_start,
+            "admission_s": admission_end - admission_start,
+            "run_engine_s": run_engine_end - run_engine_start,
+            "num_parent_requests": len(added_parent_ids),
+            "num_child_requests": sum(len(docs) for docs in seq_documents),
+            "scheduler_stats": self.llm_engine.get_benchmark_scheduler_stats(),
+        }
         parent_order = {
             parent_id: index for index, parent_id in enumerate(added_parent_ids)
         }

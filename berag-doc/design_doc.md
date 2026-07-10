@@ -24,7 +24,7 @@ However, it is not straight-forward to implement BERAG inference that is as fast
         BERAG aggregates the distributions from all branches at each decoding step. This again requires tracking the related sequences carefully and making sure that all branches have produced their current-step logits before sampling the next token. 
 
 Despite these challenges, the throughput optimization techniques such as PagedAttention[2] is conceptually situable for implementing BERAG inference. 
-    In fact, as one of the motivations for PagedAttention[2], the authors note: *"LLM services often use advanced decoding algorithms, such as parallel sampling and beamsearch, that generate multiple outputs per request. In thesescenarios, the request consists of multiple sequences that canpartially share their KV cache. However, memory sharing isnot possible in the existing systems because the KV cache ofthe sequences is stored in separate contiguous spaces."*
+    In fact, as one of the motivations for PagedAttention[2], the authors note: *"LLM services often use advanced decoding algorithms, such as parallel sampling and beamsearch, that generate multiple outputs per request. In thesescenarios, the request consists of multiple sequences that can partially share their KV cache. However, memory sharing is not possible in the existing systems because the KV cache ofthe sequences is stored in separate contiguous spaces."*
     In implementing beam search, they note that *"multiple sequences with one request (as in beam search) are gang-scheduled as a sequence group. They are always preempted or rescheduled together."*
     These mechanism should make an efficient BERAG implementation possible.
 
@@ -195,11 +195,11 @@ We now describe each phase and object in detail.
 
 Beam search is also a sequence-level decoding scheme that keeps multiple candidates. Its implementation may be instructive for BERAG.
 
-The current beam search implementation in vLLM is a wrapper above normal generation requeests. 
+The current beam search implementation in vLLM is a wrapper above normal generation requests. 
     Each active beam is turned into a normal, one-token request. 
     vLLM runs those requests, return log-probabilities, and the python beam search loop expands/prunes beams. 
 
-Unfortunately, this is problematic for BERAG implementation. An efficient BERAG implementation likely needs to incur changes in the schedular and model runner because:
+Unfortunately, this is problematic for BERAG implementation. An efficient BERAG implementation likely needs to incur changes in the scheduler and model runner because:
     * BERAG requires the scheduler to know about how each branch belongs to an overall request.
     * Gang scheduling is required. At each decode step, BERAG needs to schedule all active branches for a request in order to advance the generation.
     * Branch dropping affects KV freeing. 

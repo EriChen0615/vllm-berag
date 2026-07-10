@@ -11,7 +11,7 @@ We should test the throughput of standard RAG and BERAG on a realistic dataset.
 
 NarrativeQA [1] is a dataset that meets all of the above requires. 
     Notably, it is adapted in LongBench [2], a widely-used long-context generation benchmark, as a single-document long-context QA task.
-    NarativeQA has 7.81K document chunks of length from 100-1000 tokens. 
+    NarativeQA has 7.81K document chunks of length from 100-1000 characters. 
         Each question is based on a specific chunk, and the ID of that relevant chunk is annotated in the dataset. 
         This construction makes it easy to construct long context while ensuring relevant information is included. 
         In LongBench, the dataset is adapted so that the average input length is 18,409 tokens, the longest in its Single-Document QA test suite.

@@ -252,6 +252,7 @@ class InputProcessor:
         priority: int = 0,
         data_parallel_rank: int | None = None,
         resumable: bool = False,
+        skip_mm_cache: bool = False,
     ) -> EngineCoreRequest:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
@@ -291,6 +292,7 @@ class InputProcessor:
             processed_inputs = self.input_preprocessor.preprocess(
                 prompt,
                 tokenization_kwargs=tokenization_kwargs,
+                skip_mm_cache=skip_mm_cache,
             )
 
         current_platform.validate_request(processed_inputs, params)

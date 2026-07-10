@@ -95,6 +95,7 @@ class InputPreprocessor:
         tokenization_kwargs: dict[str, Any] | None = None,
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
+        skip_mm_cache: bool = False,
     ) -> MultiModalInput:
         """
         Apply the model's multi-modal processor to a multi-modal prompt,
@@ -106,6 +107,7 @@ class InputPreprocessor:
             mm_uuids=mm_uuids,
             mm_processor_kwargs=mm_processor_kwargs,
             tokenization_kwargs=tokenization_kwargs,
+            skip_mm_cache=skip_mm_cache,
         )
 
     def _process_embeds(
@@ -134,6 +136,8 @@ class InputPreprocessor:
         self,
         parsed_content: TokensPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        skip_mm_cache: bool = False,
     ) -> TokensInput | MultiModalInput:
         prompt_token_ids = self._truncate_inputs(
             parsed_content["prompt_token_ids"], tokenization_kwargs
@@ -147,6 +151,7 @@ class InputPreprocessor:
                 parsed_content.get("mm_processor_kwargs"),
                 tokenization_kwargs=tokenization_kwargs,
                 mm_uuids=parsed_content.get("multi_modal_uuids"),
+                skip_mm_cache=skip_mm_cache,
             )
         else:
             inputs = tokens_input(prompt_token_ids)
@@ -162,6 +167,8 @@ class InputPreprocessor:
         self,
         parsed_content: TextPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        skip_mm_cache: bool = False,
     ) -> TokensInput | MultiModalInput:
         prompt_text = parsed_content["prompt"]
 
@@ -172,6 +179,8 @@ class InputPreprocessor:
                 multi_modal_data,
                 parsed_content.get("mm_processor_kwargs") or {},
                 tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=parsed_content.get("multi_modal_uuids"),
+                skip_mm_cache=skip_mm_cache,
             )
         else:
             prompt_token_ids = self._tokenize_prompt(
@@ -192,6 +201,8 @@ class InputPreprocessor:
         self,
         prompt: EncoderDictPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        skip_mm_cache: bool = False,
     ) -> EncoderInput: ...
 
     @overload
@@ -199,6 +210,8 @@ class InputPreprocessor:
         self,
         prompt: DecoderDictPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        skip_mm_cache: bool = False,
     ) -> DecoderEngineInput: ...
 
     @overload
@@ -206,23 +219,32 @@ class InputPreprocessor:
         self,
         prompt: DecoderOnlyDictPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        skip_mm_cache: bool = False,
     ) -> DecoderOnlyEngineInput: ...
 
     def _prompt_to_llm_inputs(
         self,
         prompt: SingletonDictPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        skip_mm_cache: bool = False,
     ) -> SingletonInput:
         if "prompt_embeds" in prompt:
             return self._process_embeds(prompt)  # type: ignore[arg-type]
 
         if "prompt_token_ids" in prompt:
-            return self._process_tokens(prompt)  # type: ignore[arg-type]
+            return self._process_tokens(  # type: ignore[arg-type]
+                prompt,
+                tokenization_kwargs=tokenization_kwargs,
+                skip_mm_cache=skip_mm_cache,
+            )
 
         if "prompt" in prompt:
             return self._process_text(
                 prompt,  # type: ignore[arg-type]
                 tokenization_kwargs=tokenization_kwargs,
+                skip_mm_cache=skip_mm_cache,
             )
 
         assert_never(prompt)  # type: ignore[arg-type]
@@ -231,6 +253,8 @@ class InputPreprocessor:
         self,
         prompt: EncoderDecoderDictPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        skip_mm_cache: bool = False,
     ) -> EncoderDecoderInput:
         encoder_prompt = prompt["encoder_prompt"]
         decoder_prompt = prompt["decoder_prompt"]
@@ -248,6 +272,7 @@ class InputPreprocessor:
             encoder_input=self._prompt_to_llm_inputs(
                 encoder_prompt,
                 tokenization_kwargs=tokenization_kwargs,
+                skip_mm_cache=skip_mm_cache,
             ),
             decoder_input=(
                 None
@@ -255,6 +280,7 @@ class InputPreprocessor:
                 else self._prompt_to_llm_inputs(
                     decoder_prompt,
                     tokenization_kwargs=tokenization_kwargs,
+                    skip_mm_cache=skip_mm_cache,
                 )
             ),
             decoder_start_token_id=self.renderer.get_dec_start_token_id(),
@@ -265,16 +291,21 @@ class InputPreprocessor:
         self,
         prompt: DecoderOnlyDictPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        skip_mm_cache: bool = False,
     ) -> DecoderOnlyEngineInput:
         return self._prompt_to_llm_inputs(
             prompt,
             tokenization_kwargs=tokenization_kwargs,
+            skip_mm_cache=skip_mm_cache,
         )
 
     def preprocess(
         self,
         prompt: PromptType,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        skip_mm_cache: bool = False,
     ) -> EngineInput:
         """Preprocess the input prompt."""
         if self.model_config.is_encoder_decoder:
@@ -283,9 +314,11 @@ class InputPreprocessor:
             return self._process_encoder_decoder_prompt(
                 parse_enc_dec_prompt(prompt),
                 tokenization_kwargs,
+                skip_mm_cache=skip_mm_cache,
             )
 
         return self._process_decoder_only_prompt(
             parse_dec_only_prompt(prompt),
             tokenization_kwargs=tokenization_kwargs,
+            skip_mm_cache=skip_mm_cache,
         )

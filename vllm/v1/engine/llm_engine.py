@@ -3,7 +3,7 @@
 
 import time
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from typing import Any
 
@@ -141,9 +141,81 @@ class LLMEngine:
 
         self._berag_mode_active = False
         self._berag_child_ids_by_parent_id: dict[str, list[str]] = {}
+        self.reset_benchmark_scheduler_stats()
 
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
+
+    def reset_benchmark_scheduler_stats(self) -> None:
+        self._benchmark_scheduler_stats: dict[str, int | float] = {
+            "scheduler_steps": 0,
+            "gpu_kv_cache_usage_final": 0.0,
+            "gpu_kv_cache_usage_peak": 0.0,
+            "prefix_cache_requests": 0,
+            "prefix_cache_queries": 0,
+            "prefix_cache_hits": 0,
+            "connector_prefix_cache_requests": 0,
+            "connector_prefix_cache_queries": 0,
+            "connector_prefix_cache_hits": 0,
+        }
+
+    def _record_benchmark_scheduler_stats(
+        self, scheduler_stats: Any | None
+    ) -> None:
+        if scheduler_stats is None:
+            return
+        stats = self._benchmark_scheduler_stats
+        stats["scheduler_steps"] += 1
+        stats["gpu_kv_cache_usage_final"] = scheduler_stats.kv_cache_usage
+        stats["gpu_kv_cache_usage_peak"] = max(
+            float(stats["gpu_kv_cache_usage_peak"]),
+            scheduler_stats.kv_cache_usage,
+        )
+
+        prefix_stats = scheduler_stats.prefix_cache_stats
+        if prefix_stats.reset:
+            stats["prefix_cache_requests"] = 0
+            stats["prefix_cache_queries"] = 0
+            stats["prefix_cache_hits"] = 0
+        stats["prefix_cache_requests"] += prefix_stats.requests
+        stats["prefix_cache_queries"] += prefix_stats.queries
+        stats["prefix_cache_hits"] += prefix_stats.hits
+
+        connector_stats = scheduler_stats.connector_prefix_cache_stats
+        if connector_stats is not None:
+            if connector_stats.reset:
+                stats["connector_prefix_cache_requests"] = 0
+                stats["connector_prefix_cache_queries"] = 0
+                stats["connector_prefix_cache_hits"] = 0
+            stats["connector_prefix_cache_requests"] += connector_stats.requests
+            stats["connector_prefix_cache_queries"] += connector_stats.queries
+            stats["connector_prefix_cache_hits"] += connector_stats.hits
+
+    def get_benchmark_scheduler_stats(self) -> dict[str, int | float]:
+        stats = dict(self._benchmark_scheduler_stats)
+        prefix_queries = float(stats["prefix_cache_queries"])
+        prefix_hits = float(stats["prefix_cache_hits"])
+        connector_queries = float(stats["connector_prefix_cache_queries"])
+        connector_hits = float(stats["connector_prefix_cache_hits"])
+        stats["gpu_kv_cache_usage_final_pct"] = (
+            float(stats["gpu_kv_cache_usage_final"]) * 100
+        )
+        stats["gpu_kv_cache_usage_peak_pct"] = (
+            float(stats["gpu_kv_cache_usage_peak"]) * 100
+        )
+        stats["prefix_cache_hit_rate"] = (
+            prefix_hits / prefix_queries if prefix_queries > 0 else 0.0
+        )
+        stats["prefix_cache_hit_rate_pct"] = (
+            float(stats["prefix_cache_hit_rate"]) * 100
+        )
+        stats["connector_prefix_cache_hit_rate"] = (
+            connector_hits / connector_queries if connector_queries > 0 else 0.0
+        )
+        stats["connector_prefix_cache_hit_rate_pct"] = (
+            float(stats["connector_prefix_cache_hit_rate"]) * 100
+        )
+        return stats
 
     @classmethod
     def from_vllm_config(
@@ -314,7 +386,7 @@ class LLMEngine:
     def add_berag_request(
         self,
         request_id: str,
-        shared_prefix: str,
+        shared_prefix: str | PromptType,
         documents: list[str],
         suffix: str,
         sampling_params: SamplingParams,
@@ -340,7 +412,14 @@ class LLMEngine:
         self._berag_mode_active = True
         parent_params = copy(sampling_params)
         parent_params.output_kind = RequestOutputKind.FINAL_ONLY
-        parent_prompt = f"{shared_prefix}{suffix}"
+        shared_prefix_text, shared_prompt = self._prepare_berag_shared_prefix(
+            request_id,
+            shared_prefix,
+        )
+        parent_prompt = self._berag_prompt_with_text(
+            shared_prompt,
+            f"{shared_prefix_text}{suffix}",
+        )
 
         child_request_ids: list[str] = []
         parent_id: str | None = None
@@ -355,6 +434,7 @@ class LLMEngine:
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
                 priority=priority,
+                skip_mm_cache=True,
             )
             self.input_processor.assign_request_id(parent_req)
             parent_id = parent_req.request_id
@@ -376,7 +456,10 @@ class LLMEngine:
                 )
 
             for branch_id, document in enumerate(documents):
-                child_prompt = f"{shared_prefix}{document}{suffix}"
+                child_prompt = self._berag_prompt_with_text(
+                    shared_prompt,
+                    f"{shared_prefix_text}{document}{suffix}",
+                )
                 child_params = copy(sampling_params)
                 child_params.n = 1
                 child_params.output_kind = RequestOutputKind.FINAL_ONLY
@@ -448,6 +531,75 @@ class LLMEngine:
         assert parent_id is not None
         self._berag_child_ids_by_parent_id[parent_id] = child_request_ids
         return parent_id
+
+    @staticmethod
+    def _berag_extract_text_prefix(shared_prefix: str | PromptType) -> str:
+        if isinstance(shared_prefix, str):
+            return shared_prefix
+        if isinstance(shared_prefix, Mapping):
+            prompt = shared_prefix.get("prompt")
+            if isinstance(prompt, str):
+                return prompt
+        raise TypeError(
+            "BERAG shared_prefix must be a string or a text PromptType "
+            "dictionary with a string 'prompt' field."
+        )
+
+    @staticmethod
+    def _berag_mm_item_count(value: object) -> int:
+        if isinstance(value, Sequence) and not isinstance(
+            value,
+            (str, bytes, bytearray),
+        ):
+            return len(value)
+        return 1
+
+    @classmethod
+    def _berag_make_shared_mm_uuids(
+        cls,
+        parent_request_id: str,
+        multi_modal_data: Mapping[str, object],
+    ) -> dict[str, list[str]]:
+        return {
+            modality: [
+                f"{parent_request_id}:berag:mm:{modality}:{index}"
+                for index in range(cls._berag_mm_item_count(items))
+            ]
+            for modality, items in multi_modal_data.items()
+        }
+
+    @classmethod
+    def _prepare_berag_shared_prefix(
+        cls,
+        parent_request_id: str,
+        shared_prefix: str | PromptType,
+    ) -> tuple[str, str | PromptType]:
+        shared_prefix_text = cls._berag_extract_text_prefix(shared_prefix)
+        if isinstance(shared_prefix, str):
+            return shared_prefix_text, shared_prefix
+
+        shared_prompt = dict(shared_prefix)
+        multi_modal_data = shared_prompt.get("multi_modal_data")
+        if (
+            isinstance(multi_modal_data, Mapping)
+            and "multi_modal_uuids" not in shared_prompt
+        ):
+            shared_prompt["multi_modal_uuids"] = cls._berag_make_shared_mm_uuids(
+                parent_request_id,
+                multi_modal_data,
+            )
+        return shared_prefix_text, shared_prompt  # type: ignore[return-value]
+
+    @staticmethod
+    def _berag_prompt_with_text(
+        shared_prompt: str | PromptType,
+        text: str,
+    ) -> str | PromptType:
+        if isinstance(shared_prompt, str):
+            return text
+        prompt = dict(shared_prompt)
+        prompt["prompt"] = text
+        return prompt  # type: ignore[return-value]
 
     def _validate_berag_request(
         self,
@@ -528,6 +680,7 @@ class LLMEngine:
                 iteration_stats=iteration_stats,
             )
             self.output_processor.update_scheduler_stats(outputs.scheduler_stats)
+            self._record_benchmark_scheduler_stats(outputs.scheduler_stats)
             for output in outputs.outputs:
                 if output.finish_reason is not None:
                     self._berag_child_ids_by_parent_id.pop(output.request_id, None)

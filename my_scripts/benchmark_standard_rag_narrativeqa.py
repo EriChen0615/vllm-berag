@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -22,7 +23,7 @@ from my_scripts.narrativeqa_benchmark_utils import (  # noqa: E402
     aggregate_prediction_metrics,
     build_prediction_row,
     length_summary,
-    make_longbench_prompt,
+    make_narrativeqa_prompt,
     make_standard_rag_context,
     parse_k_values,
     read_jsonl,
@@ -64,6 +65,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", default="my_outputs/data/NarrativeQA")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-examples", type=int, default=2048)
+    parser.add_argument(
+        "--request-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of standard RAG requests per llm.generate call. "
+            "Use 1 to benchmark batch-size-one execution over many examples."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=262144)
     parser.add_argument("--truncate-prompt-tokens", type=int, default=None)
@@ -77,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--dry-run-prompts", action="store_true")
     parser.add_argument("--preview-prompts", type=int, default=2)
+    parser.add_argument("--query-image-path", default=None)
+    parser.add_argument(
+        "--query-image-uuid",
+        default="narrativeqa-shared-query-image",
+    )
     parser.add_argument("--stop-on-error", action="store_true")
     args = parser.parse_args()
     if (
@@ -90,6 +105,34 @@ def parse_args() -> argparse.Namespace:
             f"{args.max_model_len}"
         )
     return args
+
+
+def load_query_image(args: argparse.Namespace) -> Any | None:
+    if args.query_image_path is None:
+        return None
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required for --query-image-path.") from exc
+    image_path = Path(args.query_image_path)
+    if not image_path.exists():
+        raise FileNotFoundError(f"Missing query image: {image_path}")
+    with Image.open(image_path) as image:
+        return image.convert("RGB")
+
+
+def make_prompt_with_image(
+    prompt: str,
+    query_image: Any | None,
+    query_image_uuid: str,
+) -> str | dict[str, Any]:
+    if query_image is None:
+        return prompt
+    return {
+        "prompt": prompt,
+        "multi_modal_data": {"image": query_image},
+        "multi_modal_uuids": {"image": [query_image_uuid]},
+    }
 
 
 def load_tokenizer(args: argparse.Namespace) -> Any:
@@ -107,19 +150,31 @@ def render_prompts(
     rows: list[dict[str, Any]],
     tokenizer: Any,
     args: argparse.Namespace,
-) -> tuple[list[str], list[int], list[int]]:
+) -> tuple[list[str | dict[str, Any]], list[int], list[int]]:
     prompts = []
     raw_prompt_token_lengths = []
     effective_prompt_token_lengths = []
+    query_image = load_query_image(args)
     for row in rows:
         context = make_standard_rag_context(row["chunks"])
-        user_prompt = make_longbench_prompt(context, row["question"])
+        user_prompt = make_narrativeqa_prompt(
+            context,
+            row["question"],
+            include_image=query_image is not None,
+        )
         rendered_prompt = render_qwen_chat_prompt(
             tokenizer,
             user_prompt,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
+            include_image=query_image is not None,
         )
-        prompts.append(rendered_prompt)
+        prompts.append(
+            make_prompt_with_image(
+                rendered_prompt,
+                query_image,
+                args.query_image_uuid,
+            )
+        )
         raw_length = len(tokenizer.encode(rendered_prompt, add_special_tokens=False))
         raw_prompt_token_lengths.append(raw_length)
         if args.truncate_prompt_tokens is None:
@@ -147,7 +202,7 @@ def print_prompt_preview(
     *,
     k_value: int,
     rows: list[dict[str, Any]],
-    prompts: list[str],
+    prompts: list[str | dict[str, Any]],
     raw_prompt_token_lengths: list[int],
     effective_prompt_token_lengths: list[int],
     preview_count: int,
@@ -157,17 +212,22 @@ def print_prompt_preview(
     ):
         if index >= preview_count:
             break
-        has_qwen_markers = "<|im_start|>" in prompt or "<|im_end|>" in prompt
-        has_longbench_prompt = "Story:" in prompt and "Question:" in prompt
+        prompt_text = prompt["prompt"] if isinstance(prompt, dict) else prompt
+        has_qwen_markers = (
+            "<|im_start|>" in prompt_text or "<|im_end|>" in prompt_text
+        )
+        has_image_prompt = isinstance(prompt, dict) and "multi_modal_data" in prompt
+        has_longbench_prompt = "Story:" in prompt_text and "Question:" in prompt_text
         print(
             f"[prompt] k={k_value} example_id={row['example_id']} "
             f"raw_prompt_tokens={raw_tokens} "
             f"effective_prompt_tokens={effective_tokens} "
             f"qwen_markers={has_qwen_markers} "
+            f"image_prompt={has_image_prompt} "
             f"longbench_content={has_longbench_prompt}"
         )
-        print(prompt[:1200])
-        if len(prompt) > 1200:
+        print(prompt_text[:1200])
+        if len(prompt_text) > 1200:
             print("[prompt] ...")
 
 
@@ -236,6 +296,9 @@ def write_run_config(
             "trust_remote_code": args.trust_remote_code,
             "max_num_seqs": args.max_num_seqs,
             "max_num_batched_tokens": args.max_num_batched_tokens,
+            "request_batch_size": args.request_batch_size,
+            "query_image_path": args.query_image_path,
+            "query_image_uuid": args.query_image_uuid,
             "raw_prompt_token_summary": length_summary(raw_prompt_token_lengths),
             "prompt_token_summary": length_summary(effective_prompt_token_lengths),
         },
@@ -280,6 +343,63 @@ def write_failed_metrics(
     )
 
 
+def _merge_scheduler_stats(
+    totals: dict[str, float],
+    scheduler_stats: dict[str, Any],
+) -> None:
+    for key, value in scheduler_stats.items():
+        if not isinstance(value, (int, float)):
+            continue
+        numeric_value = float(value)
+        if key in {
+            "gpu_kv_cache_usage_peak",
+            "gpu_kv_cache_usage_peak_pct",
+        }:
+            totals[key] = max(totals.get(key, 0.0), numeric_value)
+        elif key in {
+            "gpu_kv_cache_usage_final",
+            "gpu_kv_cache_usage_final_pct",
+        }:
+            totals[key] = numeric_value
+        elif key.endswith("_hit_rate") or key.endswith("_hit_rate_pct"):
+            continue
+        else:
+            totals[key] = totals.get(key, 0.0) + numeric_value
+
+
+def _finalize_scheduler_stats(totals: dict[str, float]) -> dict[str, float]:
+    stats = dict(totals)
+    prefix_queries = stats.get("prefix_cache_queries", 0.0)
+    prefix_hits = stats.get("prefix_cache_hits", 0.0)
+    connector_queries = stats.get("connector_prefix_cache_queries", 0.0)
+    connector_hits = stats.get("connector_prefix_cache_hits", 0.0)
+    stats["prefix_cache_hit_rate"] = (
+        prefix_hits / prefix_queries if prefix_queries > 0 else 0.0
+    )
+    stats["prefix_cache_hit_rate_pct"] = stats["prefix_cache_hit_rate"] * 100
+    stats["connector_prefix_cache_hit_rate"] = (
+        connector_hits / connector_queries if connector_queries > 0 else 0.0
+    )
+    stats["connector_prefix_cache_hit_rate_pct"] = (
+        stats["connector_prefix_cache_hit_rate"] * 100
+    )
+    return stats
+
+
+def _merge_generate_timing(
+    totals: dict[str, float],
+    scheduler_totals: dict[str, float],
+    timing: dict[str, Any],
+) -> None:
+    for key in ("total_s", "add_requests_s", "run_engine_s"):
+        value = timing.get(key)
+        if isinstance(value, (int, float)):
+            totals[key] = totals.get(key, 0.0) + float(value)
+    scheduler_stats = timing.get("scheduler_stats") or {}
+    if isinstance(scheduler_stats, dict):
+        _merge_scheduler_stats(scheduler_totals, scheduler_stats)
+
+
 def run_one_k(
     *,
     args: argparse.Namespace,
@@ -287,9 +407,10 @@ def run_one_k(
     sampling_params: Any,
     k_value: int,
     rows: list[dict[str, Any]],
-    prompts: list[str],
+    prompts: list[str | dict[str, Any]],
     raw_prompt_token_lengths: list[int],
     effective_prompt_token_lengths: list[int],
+    prompt_render_s: float,
 ) -> None:
     k_dir = Path(args.output_dir) / "standard_rag" / f"k{k_value}"
     k_dir.mkdir(parents=True, exist_ok=True)
@@ -304,13 +425,30 @@ def run_one_k(
 
     start = time.perf_counter()
     try:
-        outputs = llm.generate(
-            prompts,
-            sampling_params=sampling_params,
-            tokenization_kwargs=make_tokenization_kwargs(args),
-            use_tqdm=not args.disable_tqdm,
-        )
+        outputs = []
+        timing_totals: dict[str, float] = {}
+        scheduler_totals: dict[str, float] = {}
+        batch_size = args.request_batch_size or len(prompts)
+        for batch_start in range(0, len(prompts), batch_size):
+            batch_end = min(batch_start + batch_size, len(prompts))
+            outputs.extend(
+                llm.generate(
+                    prompts[batch_start:batch_end],
+                    sampling_params=sampling_params,
+                    tokenization_kwargs=make_tokenization_kwargs(args),
+                    use_tqdm=not args.disable_tqdm,
+                )
+            )
+            _merge_generate_timing(
+                timing_totals,
+                scheduler_totals,
+                getattr(llm, "_last_generate_timing", {}),
+            )
         wall_time_s = time.perf_counter() - start
+        if len(outputs) != len(rows):
+            raise RuntimeError(
+                f"Expected {len(rows)} standard RAG outputs, got {len(outputs)}."
+            )
     except Exception as exc:
         wall_time_s = time.perf_counter() - start
         write_failed_metrics(
@@ -334,12 +472,34 @@ def run_one_k(
         for index, (row, output) in enumerate(zip(rows, outputs))
     ]
     metrics = aggregate_prediction_metrics(prediction_rows, wall_time_s=wall_time_s)
-    metrics.update({"status": "ok", "k": k_value})
+    scheduler_stats = _finalize_scheduler_stats(scheduler_totals)
+    metrics.update(
+        {
+            "status": "ok",
+            "k": k_value,
+            "prompt_render_s": prompt_render_s,
+            "request_batch_size": args.request_batch_size,
+            "num_request_batches": math.ceil(len(rows) / batch_size),
+            "generate_total_s": timing_totals.get("total_s", wall_time_s),
+            "generate_add_requests_s": timing_totals.get("add_requests_s"),
+            "generate_run_engine_s": timing_totals.get("run_engine_s"),
+            **scheduler_stats,
+        }
+    )
 
     write_jsonl(k_dir / "predictions.jsonl", prediction_rows)
     write_json(k_dir / "metrics.json", metrics)
+    add_requests_s = metrics["generate_add_requests_s"] or 0.0
+    run_engine_s = metrics["generate_run_engine_s"] or 0.0
+    kv_peak_pct = metrics.get("gpu_kv_cache_usage_peak_pct", 0.0)
+    prefix_hit_pct = metrics.get("prefix_cache_hit_rate_pct", 0.0)
     print(
         f"[rag] k={k_value} requests={len(rows)} wall_time={wall_time_s:.2f}s "
+        f"render={prompt_render_s:.2f}s "
+        f"add_requests={add_requests_s:.2f}s "
+        f"run_engine={run_engine_s:.2f}s "
+        f"kv_peak={kv_peak_pct:.1f}% "
+        f"prefix_hit={prefix_hit_pct:.1f}% "
         f"rps={metrics['requests_per_second']:.4f} "
         f"mean_input_tokens={metrics['mean_input_tokens']:.1f} "
         f"p90_ttft={metrics['p90_ttft_s']:.4f}s "
@@ -351,6 +511,8 @@ def run_one_k(
 def main() -> None:
     set_cache_env()
     args = parse_args()
+    if args.request_batch_size is not None and args.request_batch_size <= 0:
+        raise ValueError("--request-batch-size must be positive when set.")
     k_values = parse_k_values(args.k_values)
     data_dir = Path(args.data_dir)
     output_dir = Path(args.output_dir)
@@ -359,21 +521,31 @@ def main() -> None:
     tokenizer = load_tokenizer(args)
     rendered_by_k: dict[
         int,
-        tuple[list[dict[str, Any]], list[str], list[int], list[int]],
+        tuple[
+            list[dict[str, Any]],
+            list[str | dict[str, Any]],
+            list[int],
+            list[int],
+            float,
+        ],
     ] = {}
     for k_value in k_values:
         rows = load_k_rows(data_dir, k_value, args.max_examples)
+        render_start = time.perf_counter()
         prompts, raw_prompt_token_lengths, effective_prompt_token_lengths = (
             render_prompts(rows, tokenizer, args)
         )
+        render_s = time.perf_counter() - render_start
         rendered_by_k[k_value] = (
             rows,
             prompts,
             raw_prompt_token_lengths,
             effective_prompt_token_lengths,
+            render_s,
         )
         print(
             f"[rag] prepared k={k_value} rows={len(rows)} "
+            f"render_s={render_s:.2f}s "
             f"prompt_tokens={length_summary(effective_prompt_token_lengths)} "
             f"raw_prompt_tokens={length_summary(raw_prompt_token_lengths)}"
         )
@@ -398,6 +570,7 @@ def main() -> None:
             prompts,
             raw_prompt_token_lengths,
             effective_prompt_token_lengths,
+            prompt_render_s,
         ) = rendered_by_k[k_value]
         run_one_k(
             args=args,
@@ -408,6 +581,7 @@ def main() -> None:
             prompts=prompts,
             raw_prompt_token_lengths=raw_prompt_token_lengths,
             effective_prompt_token_lengths=effective_prompt_token_lengths,
+            prompt_render_s=prompt_render_s,
         )
 
 

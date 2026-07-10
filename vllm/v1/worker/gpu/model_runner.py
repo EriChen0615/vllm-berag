@@ -1053,7 +1053,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         shards = scheduler_output.scheduled_berag_shards
         if not shards:
             return None
-        assert self.berag_accumulator is not None
         outputs: list[BeragModelRunnerOutput] = []
         logits = None
         if input_batch is not None and hidden_states is not None:
@@ -1066,20 +1065,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         for shard in shards:
+            if not shard.direct_mix:
+                assert self.berag_accumulator is not None
             if shard.mixture_row_id >= 0:
+                assert self.berag_accumulator is not None
                 self.berag_accumulator.mark_live(shard.mixture_row_id)
+            telemetry = (
+                self.berag_accumulator.telemetry()
+                if self.berag_accumulator is not None
+                else None
+            )
             self._berag_debug_shard(
                 shard,
-                "process shard reqs=%s branches=%s rows=%s mixture_row=%s "
-                "final=%s sample=%s prior_reqs=%s telemetry=%s",
-                shard.req_ids,
-                shard.branch_ids,
-                shard.branch_row_ids,
+                "process shard scheduled_reqs=%s scheduled_branches=%s "
+                "evidence_branches=%s mix_branches=%s evidence_rows=%s "
+                "mix_rows=%s mixture_row=%s direct_mix=%s final=%s sample=%s "
+                "prior_reqs=%s telemetry=%s",
+                shard.scheduled_req_ids,
+                shard.scheduled_branch_ids,
+                shard.evidence_branch_ids,
+                shard.mix_branch_ids,
+                shard.evidence_row_ids,
+                shard.mix_row_ids,
                 shard.mixture_row_id,
+                shard.direct_mix,
                 shard.is_final_shard,
                 shard.sample_on_completion,
                 shard.prior_req_ids,
-                self.berag_accumulator.telemetry(),
+                telemetry,
             )
             prior_scores: dict[int, float] = {}
             if (
@@ -1108,13 +1121,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             sampled_token_id = None
             sampled_logprobs: dict[int, float] | None = None
-            scheduled_branch_ids = shard.scheduled_branch_ids or shard.branch_ids
-            branch_row_by_id = dict(zip(shard.branch_ids, shard.branch_row_ids))
-            if logits is not None:
-                for req_id, branch_id in zip(shard.req_ids, scheduled_branch_ids):
+            scheduled_req_by_branch = dict(
+                zip(shard.scheduled_branch_ids, shard.scheduled_req_ids)
+            )
+            evidence_row_by_id = dict(
+                zip(shard.evidence_branch_ids, shard.evidence_row_ids)
+            )
+            if logits is not None and not shard.direct_mix:
+                assert self.berag_accumulator is not None
+                for branch_id in shard.evidence_branch_ids:
+                    req_id = scheduled_req_by_branch[branch_id]
                     if req_id not in req_id_to_batch_index:
                         continue
-                    branch_row_id = branch_row_by_id[branch_id]
+                    branch_row_id = evidence_row_by_id[branch_id]
                     batch_index = req_id_to_batch_index[req_id]
                     branch_logprobs = logits[batch_index].log_softmax(
                         dim=-1
@@ -1132,49 +1151,131 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
 
             if shard.is_final_shard and shard.sample_on_completion:
-                self._berag_debug_shard(
-                    shard,
-                    "mixing branch rows=%s log_posterior=%s",
-                    shard.branch_row_ids,
-                    shard.log_posterior,
-                )
-                branch_rows = self.berag_accumulator.workspace[
-                    torch.tensor(
-                        shard.branch_row_ids, dtype=torch.int64, device=self.device
+                if shard.direct_mix:
+                    if logits is None:
+                        raise RuntimeError(
+                            "BERAG direct-mix shard requires logits from the "
+                            f"current worker pass: group={shard.group_id}."
+                        )
+                    if len(shard.mix_branch_ids) != len(shard.mix_req_ids):
+                        raise RuntimeError(
+                            "BERAG direct-mix shard has inconsistent mix "
+                            f"metadata: branches={shard.mix_branch_ids}, "
+                            f"req_ids={shard.mix_req_ids}."
+                        )
+                    batch_indices = [
+                        req_id_to_batch_index[scheduled_req_by_branch[branch_id]]
+                        for branch_id in shard.mix_branch_ids
+                    ]
+                    branch_logprobs = logits[
+                        torch.tensor(batch_indices, device=self.device)
+                    ].log_softmax(dim=-1).to(torch.bfloat16)
+                    if shard.log_posterior:
+                        if len(shard.log_posterior) != len(shard.mix_branch_ids):
+                            raise RuntimeError(
+                                "BERAG direct-mix shard has inconsistent "
+                                f"log_posterior length: group={shard.group_id}."
+                            )
+                        log_weights = torch.tensor(
+                            shard.log_posterior,
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        ).view(-1, 1)
+                    else:
+                        missing = [
+                            branch_id
+                            for branch_id in shard.mix_branch_ids
+                            if branch_id not in prior_scores
+                        ]
+                        if missing:
+                            raise RuntimeError(
+                                "BERAG direct-mix shard needs prior scores for "
+                                "first-token sampling but they were not "
+                                f"produced: group={shard.group_id}, "
+                                f"missing_branches={missing}."
+                            )
+                        prior_tensor = torch.tensor(
+                            [prior_scores[branch_id]
+                             for branch_id in shard.mix_branch_ids],
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        log_weights = (
+                            prior_tensor - torch.logsumexp(prior_tensor, dim=0)
+                        ).to(torch.bfloat16).view(-1, 1)
+                    mixture = torch.logsumexp(
+                        branch_logprobs + log_weights, dim=0
+                    ).to(torch.bfloat16)
+                    sampled_token_id = self._sample_berag_mixture(
+                        mixture, shard.mix_req_ids[0]
                     )
-                ]
-                log_weights = torch.tensor(
-                    shard.log_posterior,
-                    dtype=torch.bfloat16,
-                    device=self.device,
-                ).view(-1, 1)
-                mixture = torch.logsumexp(branch_rows + log_weights, dim=0).to(
-                    torch.bfloat16
-                )
-                self.berag_accumulator.workspace[shard.mixture_row_id].copy_(mixture)
-                self.berag_accumulator.mark_live(shard.mixture_row_id)
-                sampled_token_id = self._sample_berag_mixture(mixture, shard.req_ids[0])
-                sampled_logprobs = {}
-                for branch_id, row_id in zip(shard.branch_ids, shard.branch_row_ids):
-                    sampled_logprobs[branch_id] = float(
-                        self.berag_accumulator.workspace[row_id, sampled_token_id]
-                        .float()
-                        .cpu()
-                        .item()
+                    sampled_branch_logprobs = branch_logprobs[
+                        :, sampled_token_id
+                    ].float()
+                    sampled_logprobs = dict(
+                        zip(
+                            shard.mix_branch_ids,
+                            sampled_branch_logprobs.cpu().tolist(),
+                        )
                     )
+                else:
+                    assert self.berag_accumulator is not None
+                    self._berag_debug_shard(
+                        shard,
+                        "mixing branch rows=%s log_posterior=%s",
+                        shard.mix_row_ids,
+                        shard.log_posterior,
+                    )
+                    branch_rows = self.berag_accumulator.workspace[
+                        torch.tensor(
+                            shard.mix_row_ids, dtype=torch.int64, device=self.device
+                        )
+                    ]
+                    log_weights = torch.tensor(
+                        shard.log_posterior,
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    ).view(-1, 1)
+                    mixture = torch.logsumexp(branch_rows + log_weights, dim=0).to(
+                        torch.bfloat16
+                    )
+                    self.berag_accumulator.workspace[shard.mixture_row_id].copy_(
+                        mixture
+                    )
+                    self.berag_accumulator.mark_live(shard.mixture_row_id)
+                    sampled_token_id = self._sample_berag_mixture(
+                        mixture, shard.mix_req_ids[0]
+                    )
+                    sampled_branch_logprobs = self.berag_accumulator.workspace[
+                        torch.tensor(
+                            shard.mix_row_ids, dtype=torch.int64, device=self.device
+                        ),
+                        sampled_token_id,
+                    ].float()
+                    sampled_logprobs = dict(
+                        zip(
+                            shard.mix_branch_ids,
+                            sampled_branch_logprobs.cpu().tolist(),
+                        )
+                    )
+                telemetry = (
+                    self.berag_accumulator.telemetry()
+                    if self.berag_accumulator is not None
+                    else None
+                )
                 self._berag_debug_shard(
                     shard,
                     "sampled token=%s branch_logprobs=%s telemetry=%s",
                     sampled_token_id,
                     sampled_logprobs,
-                    self.berag_accumulator.telemetry(),
+                    telemetry,
                 )
 
             outputs.append(
                 BeragModelRunnerOutput(
                     group_id=shard.group_id,
                     step_id=shard.step_id,
-                    completed_branch_ids=scheduled_branch_ids,
+                    completed_branch_ids=shard.evidence_branch_ids,
                     prior_scores=prior_scores or None,
                     sampled_token_id=sampled_token_id,
                     sampled_token_logprobs=sampled_logprobs,

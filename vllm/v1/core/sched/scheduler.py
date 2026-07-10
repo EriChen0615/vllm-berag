@@ -113,6 +113,7 @@ class BeragGroupState:
     mixture_row_id: int | None = None
     branch_row_ids: dict[int, int] = field(default_factory=dict)
     pending_finalize: bool = False
+    step_started: bool = False
     parent_queued_ts: float | None = None
     first_scheduled_ts: float | None = None
     parent_events_emitted: bool = False
@@ -151,6 +152,18 @@ class BeragGroupState:
         self.mixture_row_id = None
         self.branch_row_ids.clear()
         self.pending_finalize = False
+        self.step_started = False
+
+
+@dataclass
+class BeragBranchSchedulePlan:
+    request: Request
+    branch_id: int
+    num_computed_tokens: int
+    num_new_tokens: int
+    new_computed_blocks: KVCacheBlocks | None = None
+    num_new_local_computed_tokens: int = 0
+    was_waiting: bool = False
 
 
 class Scheduler(SchedulerInterface):
@@ -417,6 +430,7 @@ class Scheduler(SchedulerInterface):
 
         self.berag_config = vllm_config.berag_config
         self.berag_groups: dict[str, BeragGroupState] = {}
+        self.berag_group_order: deque[str] = deque()
         self.berag_row_allocator = BeragRowAllocator(
             self.berag_config.num_accumulator_rows
         )
@@ -602,8 +616,12 @@ class Scheduler(SchedulerInterface):
         with self.berag_group_trace_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, sort_keys=True) + "\n")
 
-    def _find_ready_berag_finalize(self) -> ScheduledBeragShard | None:
-        for group in self.berag_groups.values():
+    def _collect_ready_berag_finalizes(self) -> list[ScheduledBeragShard]:
+        shards: list[ScheduledBeragShard] = []
+        for group_id in list(self.berag_group_order):
+            group = self.berag_groups.get(group_id)
+            if group is None:
+                continue
             if (
                 group.pending_finalize
                 and group.all_children_registered
@@ -630,45 +648,76 @@ class Scheduler(SchedulerInterface):
                 self._write_berag_group_trace(
                     group,
                     "schedule_deferred_final_shard",
-                    req_ids=req_ids,
-                    branch_ids=branch_ids,
-                    branch_row_ids=row_ids,
+                    mix_req_ids=req_ids,
+                    mix_branch_ids=branch_ids,
+                    mix_row_ids=row_ids,
                     mixture_row_id=group.mixture_row_id,
                     is_final_shard=True,
                     sample_on_completion=True,
                 )
-                return ScheduledBeragShard(
+                shards.append(ScheduledBeragShard(
                     group_id=group.group_id,
                     step_id=group.step_id,
-                    req_ids=req_ids,
-                    branch_ids=branch_ids,
                     mixture_row_id=group.mixture_row_id,
-                    branch_row_ids=row_ids,
+                    scheduled_req_ids=[],
+                    scheduled_branch_ids=[],
+                    prior_req_ids=[],
+                    prior_branch_ids=[],
+                    prior_token_indices=[],
+                    evidence_branch_ids=[],
+                    evidence_row_ids=[],
+                    mix_req_ids=req_ids,
+                    mix_branch_ids=branch_ids,
+                    mix_row_ids=row_ids,
                     log_posterior=[
                         group.log_posterior[branch_id] for branch_id in branch_ids
                     ],
                     is_final_shard=True,
                     sample_on_completion=True,
                     debug=group.debug,
-                )
-        return None
+                ))
+        return shards
 
     @staticmethod
-    def _berag_range_covers_prior(
-        request: Request, num_new_tokens: int
+    def _berag_range_covers_prior_from(
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
     ) -> bool:
         meta = request.berag_child
         if meta is None:
             return False
-        start = request.num_computed_tokens
+        start = num_computed_tokens
         end = start + num_new_tokens
         return start <= meta.prior_token_index < end
 
+    @classmethod
+    def _berag_range_covers_prior(
+        cls, request: Request, num_new_tokens: int
+    ) -> bool:
+        return cls._berag_range_covers_prior_from(
+            request,
+            request.num_computed_tokens,
+            num_new_tokens,
+        )
+
     @staticmethod
-    def _berag_emits_evidence(request: Request, num_new_tokens: int) -> bool:
+    def _berag_emits_evidence_from(
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> bool:
         if request.berag_child is None:
             return False
-        return request.num_computed_tokens + num_new_tokens >= request.num_tokens
+        return num_computed_tokens + num_new_tokens >= request.num_tokens
+
+    @classmethod
+    def _berag_emits_evidence(cls, request: Request, num_new_tokens: int) -> bool:
+        return cls._berag_emits_evidence_from(
+            request,
+            request.num_computed_tokens,
+            num_new_tokens,
+        )
 
     def _berag_group_is_ready_to_schedule(self, request: Request) -> bool:
         meta = request.berag_child
@@ -700,12 +749,17 @@ class Scheduler(SchedulerInterface):
     def _try_reserve_berag_rows(
         self,
         request: Request,
+        num_computed_tokens: int,
         num_new_tokens: int,
         reserved_mixture_groups: set[str],
         reserved_branch_rows: set[tuple[str, int]],
     ) -> bool:
         meta = request.berag_child
-        if meta is None or not self._berag_emits_evidence(request, num_new_tokens):
+        if meta is None or not self._berag_emits_evidence_from(
+            request,
+            num_computed_tokens,
+            num_new_tokens,
+        ):
             return True
         group = self.berag_groups[meta.group_id]
         needed = 0
@@ -742,19 +796,30 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int],
     ) -> list[ScheduledBeragShard] | None:
         shards: list[ScheduledBeragShard] = []
-        group_to_req_ids: dict[str, list[str]] = defaultdict(list)
+        group_to_scheduled_req_ids: dict[str, list[str]] = defaultdict(list)
+        group_to_evidence_req_ids: dict[str, list[str]] = defaultdict(list)
         group_to_prior_req_ids: dict[str, list[str]] = defaultdict(list)
         for req_id, num_tokens in num_scheduled_tokens.items():
             request = self.requests[req_id]
             if request.berag_child is None:
                 continue
             meta = request.berag_child
+            group_to_scheduled_req_ids[meta.group_id].append(req_id)
             if self._berag_emits_evidence(request, num_tokens):
-                group_to_req_ids[meta.group_id].append(req_id)
+                group_to_evidence_req_ids[meta.group_id].append(req_id)
             if self._berag_range_covers_prior(request, num_tokens):
                 group_to_prior_req_ids[meta.group_id].append(req_id)
 
-        for group_id in set(group_to_req_ids) | set(group_to_prior_req_ids):
+        ordered_group_ids = [
+            group_id
+            for group_id in self.berag_group_order
+            if (
+                group_id in group_to_scheduled_req_ids
+                or group_id in group_to_evidence_req_ids
+                or group_id in group_to_prior_req_ids
+            )
+        ]
+        for group_id in ordered_group_ids:
             group = self.berag_groups[group_id]
             if not group.all_children_registered:
                 raise RuntimeError(
@@ -763,9 +828,12 @@ class Scheduler(SchedulerInterface):
                     f"children={len(group.child_request_ids)}/"
                     f"{group.num_branches}."
                 )
-            req_ids = group_to_req_ids.get(group_id, [])
-            if group.first_scheduled_ts is None and req_ids:
-                for req_id in req_ids:
+            scheduled_req_ids = group_to_scheduled_req_ids.get(group_id, [])
+            evidence_req_ids = group_to_evidence_req_ids.get(group_id, [])
+            if scheduled_req_ids:
+                group.step_started = True
+            if group.first_scheduled_ts is None and scheduled_req_ids:
+                for req_id in scheduled_req_ids:
                     for event in reversed(self.requests[req_id].events):
                         if event.type == EngineCoreEventType.SCHEDULED:
                             group.first_scheduled_ts = event.timestamp
@@ -773,73 +841,107 @@ class Scheduler(SchedulerInterface):
                     if group.first_scheduled_ts is not None:
                         break
             scheduled_branch_ids: list[int] = []
-            scheduled_branch_row_ids: list[int] = []
-            if req_ids and group.mixture_row_id is None:
-                group.mixture_row_id = self.berag_row_allocator.allocate()
-            for req_id in req_ids:
+            for req_id in scheduled_req_ids:
                 meta = self.requests[req_id].berag_child
                 assert meta is not None
                 scheduled_branch_ids.append(meta.branch_id)
+
+            evidence_branch_ids: list[int] = []
+            evidence_row_ids: list[int] = []
+            rows_needed = 0
+            if evidence_req_ids and group.mixture_row_id is None:
+                rows_needed += 1
+            for req_id in evidence_req_ids:
+                meta = self.requests[req_id].berag_child
+                assert meta is not None
+                if meta.branch_id not in group.branch_row_ids:
+                    rows_needed += 1
+            if self.berag_row_allocator.free_count < rows_needed:
+                raise RuntimeError(
+                    "BERAG row reservation invariant violated: "
+                    f"group={group_id}, evidence_req_ids={evidence_req_ids}, "
+                    f"rows_needed={rows_needed}, "
+                    f"free_rows={self.berag_row_allocator.free_count}."
+                )
+            if evidence_req_ids and group.mixture_row_id is None:
+                group.mixture_row_id = self.berag_row_allocator.allocate()
+            for req_id in evidence_req_ids:
+                meta = self.requests[req_id].berag_child
+                assert meta is not None
+                evidence_branch_ids.append(meta.branch_id)
                 if meta.branch_id not in group.branch_row_ids:
                     group.branch_row_ids[meta.branch_id] = (
                         self.berag_row_allocator.allocate()
                     )
-                scheduled_branch_row_ids.append(group.branch_row_ids[meta.branch_id])
+                evidence_row_ids.append(group.branch_row_ids[meta.branch_id])
 
-            completed_after = group.completed_branch_ids | set(scheduled_branch_ids)
+            completed_after = group.completed_branch_ids | set(evidence_branch_ids)
             is_final = group.active_branch_ids.issubset(completed_after)
             priors_ready = group.priors_ready
             sample_on_completion = bool(is_final and priors_ready)
             if is_final and not sample_on_completion:
                 group.pending_finalize = True
 
+            mix_req_ids: list[str] = []
+            mix_branch_ids: list[int] = []
+            mix_row_ids: list[int] = []
+            log_posterior: list[float] = []
             if sample_on_completion:
                 self._ensure_berag_posterior(group)
-                branch_ids = sorted(group.active_branch_ids)
-                branch_row_ids = [
-                    group.branch_row_ids[branch_id] for branch_id in branch_ids
+                mix_branch_ids = sorted(group.active_branch_ids)
+                mix_req_ids = [
+                    group.child_request_ids[branch_id]
+                    for branch_id in mix_branch_ids
                 ]
-            else:
-                branch_ids = scheduled_branch_ids
-                branch_row_ids = scheduled_branch_row_ids
+                mix_row_ids = [
+                    group.branch_row_ids[branch_id] for branch_id in mix_branch_ids
+                ]
+                log_posterior = [
+                    group.log_posterior[branch_id] for branch_id in mix_branch_ids
+                ]
 
             prior_req_ids = group_to_prior_req_ids.get(group_id)
-            prior_token_indices = None
+            prior_branch_ids: list[int] = []
+            prior_token_indices: list[int] = []
             if prior_req_ids:
-                prior_token_indices = []
                 for req_id in prior_req_ids:
                     meta = self.requests[req_id].berag_child
                     assert meta is not None
+                    prior_branch_ids.append(meta.branch_id)
                     prior_token_indices.append(meta.prior_token_index)
             shard = ScheduledBeragShard(
                 group_id=group_id,
                 step_id=group.step_id,
-                req_ids=req_ids,
-                branch_ids=branch_ids,
                 mixture_row_id=group.mixture_row_id
                 if group.mixture_row_id is not None
                 else -1,
-                branch_row_ids=branch_row_ids,
-                log_posterior=[
-                    group.log_posterior.get(branch_id, 0.0)
-                    for branch_id in branch_ids
-                ],
+                scheduled_req_ids=scheduled_req_ids,
+                scheduled_branch_ids=scheduled_branch_ids,
+                prior_req_ids=prior_req_ids or [],
+                prior_branch_ids=prior_branch_ids,
+                prior_token_indices=prior_token_indices,
+                evidence_branch_ids=evidence_branch_ids,
+                evidence_row_ids=evidence_row_ids,
+                mix_req_ids=mix_req_ids,
+                mix_branch_ids=mix_branch_ids,
+                mix_row_ids=mix_row_ids,
+                log_posterior=log_posterior,
                 is_final_shard=is_final,
                 sample_on_completion=sample_on_completion,
-                scheduled_branch_ids=scheduled_branch_ids,
-                prior_req_ids=prior_req_ids,
-                prior_token_indices=prior_token_indices,
                 debug=group.debug,
             )
             self._berag_debug(
                 group,
-                "emit shard scheduled_branches=%s branches=%s reqs=%s "
-                "rows=%s mixture_row=%s prior_reqs=%s final=%s sample=%s "
+                "emit shard scheduled_branches=%s evidence_branches=%s "
+                "mix_branches=%s reqs=%s evidence_rows=%s mix_rows=%s "
+                "mixture_row=%s prior_reqs=%s final=%s sample=%s "
                 "pending_finalize=%s completed_before=%s active=%s",
                 scheduled_branch_ids,
-                branch_ids,
-                req_ids,
-                branch_row_ids,
+                evidence_branch_ids,
+                mix_branch_ids,
+                scheduled_req_ids,
+                evidence_row_ids,
+                mix_row_ids,
                 shard.mixture_row_id,
                 prior_req_ids,
                 is_final,
@@ -851,12 +953,16 @@ class Scheduler(SchedulerInterface):
             self._write_berag_group_trace(
                 group,
                 "schedule_shard",
-                req_ids=req_ids,
+                scheduled_req_ids=scheduled_req_ids,
                 scheduled_branch_ids=scheduled_branch_ids,
-                branch_ids=branch_ids,
-                branch_row_ids=branch_row_ids,
+                evidence_branch_ids=evidence_branch_ids,
+                evidence_row_ids=evidence_row_ids,
+                mix_req_ids=mix_req_ids,
+                mix_branch_ids=mix_branch_ids,
+                mix_row_ids=mix_row_ids,
                 mixture_row_id=shard.mixture_row_id,
                 prior_req_ids=prior_req_ids or [],
+                prior_branch_ids=prior_branch_ids,
                 prior_token_indices=prior_token_indices or [],
                 is_final_shard=is_final,
                 sample_on_completion=sample_on_completion,
@@ -1103,6 +1209,10 @@ class Scheduler(SchedulerInterface):
                     self._free_request(request)
                     stopped_running.add(request)
                 self.berag_groups.pop(group.group_id, None)
+                try:
+                    self.berag_group_order.remove(group.group_id)
+                except ValueError:
+                    pass
             else:
                 self._release_berag_step_rows(group)
                 group.reset_step()
@@ -1148,14 +1258,893 @@ class Scheduler(SchedulerInterface):
                 f"live={expected_live})."
             )
 
+    def _berag_group_has_pending_work(self, group: BeragGroupState) -> bool:
+        if not group.all_children_registered or group.pending_finalize:
+            return False
+        for branch_id in sorted(group.active_branch_ids - group.completed_branch_ids):
+            req_id = group.child_request_ids[branch_id]
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            if (
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens
+            ) > 0:
+                return True
+            if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                return True
+        return False
+
+    def _berag_ordered_groups_for_work(self) -> list[BeragGroupState]:
+        groups: list[BeragGroupState] = []
+        for in_progress in (True, False):
+            for group_id in list(self.berag_group_order):
+                group = self.berag_groups.get(group_id)
+                if group is None or not self._berag_group_has_pending_work(group):
+                    continue
+                group_in_progress = group.step_started or bool(
+                    group.completed_branch_ids
+                )
+                if group_in_progress == in_progress:
+                    groups.append(group)
+        return groups
+
+    def _remove_berag_waiting_request(self, request: Request) -> None:
+        for queue in (self.waiting, self.skipped_waiting):
+            if any(queued is request for queued in queue):
+                queue.remove_request(request)
+                return
+
+    def _plan_berag_branch_request(
+        self,
+        request: Request,
+        token_budget: int,
+        virtual_running_reqs: int,
+    ) -> BeragBranchSchedulePlan | None:
+        meta = request.berag_child
+        assert meta is not None
+        if request.status == RequestStatus.RUNNING:
+            if self.current_step < request.next_decode_eligible_step:
+                return None
+            num_new_tokens = (
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens
+            )
+            threshold = self.scheduler_config.long_prefill_token_threshold
+            if 0 < threshold < num_new_tokens:
+                num_new_tokens = threshold
+            num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = min(
+                num_new_tokens,
+                self.max_model_len
+                - request.num_computed_tokens
+                - self.num_sampled_tokens_per_step,
+            )
+            if num_new_tokens <= 0:
+                return None
+            return BeragBranchSchedulePlan(
+                request=request,
+                branch_id=meta.branch_id,
+                num_computed_tokens=request.num_computed_tokens,
+                num_new_tokens=num_new_tokens,
+            )
+
+        if request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            return None
+        if virtual_running_reqs >= self.max_num_running_reqs:
+            return None
+
+        if request.num_computed_tokens == 0:
+            new_computed_blocks, num_new_local_computed_tokens = (
+                self.kv_cache_manager.get_computed_blocks(request)
+            )
+            num_computed_tokens = num_new_local_computed_tokens
+        else:
+            new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+            num_new_local_computed_tokens = 0
+            num_computed_tokens = request.num_computed_tokens
+
+        num_new_tokens = request.num_tokens - num_computed_tokens
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < num_new_tokens:
+            num_new_tokens = threshold
+        if (
+            not self.scheduler_config.enable_chunked_prefill
+            and num_new_tokens > token_budget
+        ):
+            return None
+        num_new_tokens = min(num_new_tokens, token_budget)
+        if num_new_tokens <= 0:
+            return None
+
+        return BeragBranchSchedulePlan(
+            request=request,
+            branch_id=meta.branch_id,
+            num_computed_tokens=num_computed_tokens,
+            num_new_tokens=num_new_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_new_local_computed_tokens=num_new_local_computed_tokens,
+            was_waiting=True,
+        )
+
+    def _commit_berag_branch_plan(
+        self,
+        plan: BeragBranchSchedulePlan,
+        scheduled_timestamp: float,
+        scheduled_new_reqs: list[Request],
+        scheduled_resumed_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        num_scheduled_tokens: dict[str, int],
+        scheduled_encoder_inputs: dict[str, list[int]],
+        encoder_compute_budget: int,
+    ) -> tuple[bool, int]:
+        request = plan.request
+        num_new_tokens = plan.num_new_tokens
+        encoder_inputs_to_schedule = None
+        external_load_encoder_input: list[int] = []
+        new_encoder_compute_budget = encoder_compute_budget
+        if request.has_encoder_inputs:
+            (
+                encoder_inputs_to_schedule,
+                num_new_tokens,
+                new_encoder_compute_budget,
+                external_load_encoder_input,
+            ) = self._try_schedule_encoder_inputs(
+                request,
+                plan.num_computed_tokens,
+                num_new_tokens,
+                encoder_compute_budget,
+                shift_computed_tokens=1 if self.use_eagle else 0,
+            )
+            if num_new_tokens != plan.num_new_tokens:
+                return False, encoder_compute_budget
+
+        if request.status == RequestStatus.RUNNING:
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                request,
+                num_new_tokens,
+                num_lookahead_tokens=self.num_lookahead_tokens,
+            )
+            if new_blocks is None:
+                return False, encoder_compute_budget
+            scheduled_running_reqs.append(request)
+            req_to_new_blocks[request.request_id] = new_blocks
+            num_scheduled_tokens[request.request_id] = num_new_tokens
+            if encoder_inputs_to_schedule:
+                scheduled_encoder_inputs[request.request_id] = (
+                    encoder_inputs_to_schedule
+                )
+                for i in encoder_inputs_to_schedule:
+                    self.encoder_cache_manager.allocate(request, i)
+                    if self.ec_connector is not None:
+                        self.ec_connector.update_state_after_alloc(request, i)
+                encoder_compute_budget = new_encoder_compute_budget
+            if external_load_encoder_input:
+                for i in external_load_encoder_input:
+                    self.encoder_cache_manager.allocate(request, i)
+                    if self.ec_connector is not None:
+                        self.ec_connector.update_state_after_alloc(request, i)
+            return True, encoder_compute_budget
+
+        if request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            return False, encoder_compute_budget
+        has_scheduled_reqs = bool(
+            self.running
+            or scheduled_new_reqs
+            or scheduled_resumed_reqs
+            or scheduled_running_reqs
+        )
+        new_blocks = self.kv_cache_manager.allocate_slots(
+            request,
+            num_new_tokens,
+            num_new_computed_tokens=plan.num_new_local_computed_tokens,
+            new_computed_blocks=plan.new_computed_blocks,
+            num_lookahead_tokens=self.num_lookahead_tokens,
+            has_scheduled_reqs=has_scheduled_reqs,
+        )
+        if new_blocks is None:
+            if request.has_encoder_inputs:
+                self.encoder_cache_manager.free(request)
+            return False, encoder_compute_budget
+
+        if request.num_computed_tokens == 0:
+            if self.kv_cache_manager.log_stats:
+                assert self.kv_cache_manager.prefix_cache_stats is not None
+                self.kv_cache_manager.prefix_cache_stats.record(
+                    num_tokens=request.num_tokens,
+                    num_hits=plan.num_new_local_computed_tokens,
+                    preempted=request.num_preemptions > 0,
+                )
+            if request.prefill_stats is not None:
+                request.prefill_stats.set(
+                    num_prompt_tokens=request.num_prompt_tokens,
+                    num_local_cached_tokens=plan.num_new_local_computed_tokens,
+                    num_external_cached_tokens=0,
+                )
+
+        self._remove_berag_waiting_request(request)
+        self.running.append(request)
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+        if request.status == RequestStatus.WAITING:
+            scheduled_new_reqs.append(request)
+        else:
+            scheduled_resumed_reqs.append(request)
+
+        req_to_new_blocks[request.request_id] = self.kv_cache_manager.get_blocks(
+            request.request_id
+        )
+        num_scheduled_tokens[request.request_id] = num_new_tokens
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = plan.num_computed_tokens
+        if plan.num_computed_tokens + num_new_tokens < request.num_tokens:
+            self._inflight_prefills.add(request)
+        if encoder_inputs_to_schedule:
+            scheduled_encoder_inputs[request.request_id] = encoder_inputs_to_schedule
+            for i in encoder_inputs_to_schedule:
+                self.encoder_cache_manager.allocate(request, i)
+                if self.ec_connector is not None:
+                    self.ec_connector.update_state_after_alloc(request, i)
+            encoder_compute_budget = new_encoder_compute_budget
+        if external_load_encoder_input:
+            for i in external_load_encoder_input:
+                self.encoder_cache_manager.allocate(request, i)
+                if self.ec_connector is not None:
+                    self.ec_connector.update_state_after_alloc(request, i)
+        return True, encoder_compute_budget
+
+    def _berag_evidence_branch_ids_for_plans(
+        self, plans: list[BeragBranchSchedulePlan]
+    ) -> list[int]:
+        return [
+            plan.branch_id
+            for plan in plans
+            if self._berag_emits_evidence_from(
+                plan.request,
+                plan.num_computed_tokens,
+                plan.num_new_tokens,
+            )
+        ]
+
+    def _berag_rows_needed_for_plans(
+        self, group: BeragGroupState, plans: list[BeragBranchSchedulePlan]
+    ) -> int:
+        evidence_branch_ids = self._berag_evidence_branch_ids_for_plans(plans)
+        if not evidence_branch_ids:
+            return 0
+        needed = 0 if group.mixture_row_id is not None else 1
+        for branch_id in evidence_branch_ids:
+            if branch_id not in group.branch_row_ids:
+                needed += 1
+        return needed
+
+    def _berag_direct_mix_candidate(
+        self, group: BeragGroupState, plans: list[BeragBranchSchedulePlan]
+    ) -> bool:
+        if not plans:
+            return False
+        if group.completed_branch_ids or group.branch_row_ids:
+            return False
+        if group.mixture_row_id is not None:
+            return False
+        evidence_branch_ids = set(self._berag_evidence_branch_ids_for_plans(plans))
+        if not group.active_branch_ids.issubset(evidence_branch_ids):
+            return False
+        prior_branch_ids = {
+            plan.branch_id
+            for plan in plans
+            if self._berag_range_covers_prior_from(
+                plan.request,
+                plan.num_computed_tokens,
+                plan.num_new_tokens,
+            )
+        }
+        return group.priors_ready or group.active_branch_ids.issubset(
+            prior_branch_ids
+        )
+
+    def _make_berag_shard_from_committed_plans(
+        self, group: BeragGroupState, plans: list[BeragBranchSchedulePlan]
+    ) -> ScheduledBeragShard | None:
+        scheduled_req_ids = [plan.request.request_id for plan in plans]
+        scheduled_branch_ids = [plan.branch_id for plan in plans]
+        if scheduled_req_ids:
+            group.step_started = True
+        if group.first_scheduled_ts is None and scheduled_req_ids:
+            for plan in plans:
+                for event in reversed(plan.request.events):
+                    if event.type == EngineCoreEventType.SCHEDULED:
+                        group.first_scheduled_ts = event.timestamp
+                        break
+                if group.first_scheduled_ts is not None:
+                    break
+
+        prior_req_ids: list[str] = []
+        prior_branch_ids: list[int] = []
+        prior_token_indices: list[int] = []
+        for plan in plans:
+            if self._berag_range_covers_prior_from(
+                plan.request, plan.num_computed_tokens, plan.num_new_tokens
+            ):
+                meta = plan.request.berag_child
+                assert meta is not None
+                prior_req_ids.append(plan.request.request_id)
+                prior_branch_ids.append(plan.branch_id)
+                prior_token_indices.append(meta.prior_token_index)
+
+        evidence_plans = [
+            plan
+            for plan in plans
+            if self._berag_emits_evidence_from(
+                plan.request,
+                plan.num_computed_tokens,
+                plan.num_new_tokens,
+            )
+        ]
+        evidence_branch_ids = [plan.branch_id for plan in evidence_plans]
+        completed_after = group.completed_branch_ids | set(evidence_branch_ids)
+        is_final = group.active_branch_ids.issubset(completed_after)
+        direct_mix_priors_ready = group.priors_ready or (
+            group.active_branch_ids.issubset(set(prior_branch_ids))
+        )
+        direct_mix = bool(
+            is_final
+            and direct_mix_priors_ready
+            and not group.completed_branch_ids
+            and not group.branch_row_ids
+            and group.mixture_row_id is None
+            and group.active_branch_ids.issubset(evidence_branch_ids)
+        )
+        sample_on_completion = bool(
+            is_final and (group.priors_ready or direct_mix)
+        )
+
+        evidence_row_ids: list[int] = []
+        if evidence_plans and not direct_mix:
+            rows_needed = self._berag_rows_needed_for_plans(group, plans)
+            if self.berag_row_allocator.free_count < rows_needed:
+                return None
+            if group.mixture_row_id is None:
+                group.mixture_row_id = self.berag_row_allocator.allocate()
+            for plan in evidence_plans:
+                if plan.branch_id not in group.branch_row_ids:
+                    group.branch_row_ids[plan.branch_id] = (
+                        self.berag_row_allocator.allocate()
+                    )
+                evidence_row_ids.append(group.branch_row_ids[plan.branch_id])
+
+        if is_final and not sample_on_completion:
+            group.pending_finalize = True
+
+        mix_req_ids: list[str] = []
+        mix_branch_ids: list[int] = []
+        mix_row_ids: list[int] = []
+        log_posterior: list[float] = []
+        if sample_on_completion:
+            if group.priors_ready:
+                self._ensure_berag_posterior(group)
+            mix_branch_ids = sorted(group.active_branch_ids)
+            mix_req_ids = [
+                group.child_request_ids[branch_id] for branch_id in mix_branch_ids
+            ]
+            if not direct_mix:
+                mix_row_ids = [
+                    group.branch_row_ids[branch_id] for branch_id in mix_branch_ids
+                ]
+            if group.log_posterior:
+                log_posterior = [
+                    group.log_posterior[branch_id] for branch_id in mix_branch_ids
+                ]
+
+        shard = ScheduledBeragShard(
+            group_id=group.group_id,
+            step_id=group.step_id,
+            mixture_row_id=-1
+            if direct_mix or group.mixture_row_id is None
+            else group.mixture_row_id,
+            scheduled_req_ids=scheduled_req_ids,
+            scheduled_branch_ids=scheduled_branch_ids,
+            prior_req_ids=prior_req_ids,
+            prior_branch_ids=prior_branch_ids,
+            prior_token_indices=prior_token_indices,
+            evidence_branch_ids=evidence_branch_ids,
+            evidence_row_ids=evidence_row_ids,
+            mix_req_ids=mix_req_ids,
+            mix_branch_ids=mix_branch_ids,
+            mix_row_ids=mix_row_ids,
+            log_posterior=log_posterior,
+            is_final_shard=is_final,
+            direct_mix=direct_mix,
+            sample_on_completion=sample_on_completion,
+            debug=group.debug,
+        )
+        self._berag_debug(
+            group,
+            "emit shard scheduled_branches=%s evidence_branches=%s "
+            "mix_branches=%s reqs=%s evidence_rows=%s mix_rows=%s "
+            "mixture_row=%s direct_mix=%s prior_reqs=%s final=%s sample=%s "
+            "pending_finalize=%s completed_before=%s active=%s",
+            scheduled_branch_ids,
+            evidence_branch_ids,
+            mix_branch_ids,
+            scheduled_req_ids,
+            evidence_row_ids,
+            mix_row_ids,
+            shard.mixture_row_id,
+            direct_mix,
+            prior_req_ids,
+            is_final,
+            sample_on_completion,
+            group.pending_finalize,
+            sorted(group.completed_branch_ids),
+            sorted(group.active_branch_ids),
+        )
+        self._write_berag_group_trace(
+            group,
+            "schedule_shard",
+            scheduled_req_ids=scheduled_req_ids,
+            scheduled_branch_ids=scheduled_branch_ids,
+            evidence_branch_ids=evidence_branch_ids,
+            evidence_row_ids=evidence_row_ids,
+            mix_req_ids=mix_req_ids,
+            mix_branch_ids=mix_branch_ids,
+            mix_row_ids=mix_row_ids,
+            mixture_row_id=shard.mixture_row_id,
+            direct_mix=direct_mix,
+            prior_req_ids=prior_req_ids,
+            prior_branch_ids=prior_branch_ids,
+            prior_token_indices=prior_token_indices,
+            is_final_shard=is_final,
+            sample_on_completion=sample_on_completion,
+        )
+        return shard
+
+    def _schedule_berag_running_request(
+        self,
+        request: Request,
+        token_budget: int,
+        scheduled_running_reqs: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        num_scheduled_tokens: dict[str, int],
+        reserved_mixture_groups: set[str],
+        reserved_branch_rows: set[tuple[str, int]],
+    ) -> int:
+        if request.status != RequestStatus.RUNNING:
+            return token_budget
+        if self.current_step < request.next_decode_eligible_step:
+            return token_budget
+
+        num_new_tokens = (
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens
+        )
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < num_new_tokens:
+            num_new_tokens = threshold
+        num_new_tokens = min(num_new_tokens, token_budget)
+        num_new_tokens = min(
+            num_new_tokens,
+            self.max_model_len
+            - request.num_computed_tokens
+            - self.num_sampled_tokens_per_step,
+        )
+        if num_new_tokens <= 0:
+            return token_budget
+
+        if not self._try_reserve_berag_rows(
+            request,
+            request.num_computed_tokens,
+            num_new_tokens,
+            reserved_mixture_groups,
+            reserved_branch_rows,
+        ):
+            return token_budget
+
+        new_blocks = self.kv_cache_manager.allocate_slots(
+            request,
+            num_new_tokens,
+            num_lookahead_tokens=self.num_lookahead_tokens,
+        )
+        if new_blocks is None:
+            return token_budget
+
+        scheduled_running_reqs.append(request)
+        req_to_new_blocks[request.request_id] = new_blocks
+        num_scheduled_tokens[request.request_id] = num_new_tokens
+        return token_budget - num_new_tokens
+
+    def _schedule_berag_waiting_request(
+        self,
+        request: Request,
+        token_budget: int,
+        scheduled_timestamp: float,
+        scheduled_new_reqs: list[Request],
+        scheduled_resumed_reqs: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        num_scheduled_tokens: dict[str, int],
+        reserved_mixture_groups: set[str],
+        reserved_branch_rows: set[tuple[str, int]],
+    ) -> int:
+        if request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            return token_budget
+        if len(self.running) == self.max_num_running_reqs:
+            return token_budget
+
+        if request.num_computed_tokens == 0:
+            new_computed_blocks, num_new_local_computed_tokens = (
+                self.kv_cache_manager.get_computed_blocks(request)
+            )
+            if self.kv_cache_manager.log_stats:
+                assert self.kv_cache_manager.prefix_cache_stats is not None
+                self.kv_cache_manager.prefix_cache_stats.record(
+                    num_tokens=request.num_tokens,
+                    num_hits=num_new_local_computed_tokens,
+                    preempted=request.num_preemptions > 0,
+                )
+            num_computed_tokens = num_new_local_computed_tokens
+            if request.prefill_stats is not None:
+                request.prefill_stats.set(
+                    num_prompt_tokens=request.num_prompt_tokens,
+                    num_local_cached_tokens=num_new_local_computed_tokens,
+                    num_external_cached_tokens=0,
+                )
+        else:
+            new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+            num_new_local_computed_tokens = 0
+            num_computed_tokens = request.num_computed_tokens
+
+        num_new_tokens = request.num_tokens - num_computed_tokens
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < num_new_tokens:
+            num_new_tokens = threshold
+        if (
+            not self.scheduler_config.enable_chunked_prefill
+            and num_new_tokens > token_budget
+        ):
+            return token_budget
+        num_new_tokens = min(num_new_tokens, token_budget)
+        if num_new_tokens <= 0:
+            return token_budget
+
+        if not self._try_reserve_berag_rows(
+            request,
+            num_computed_tokens,
+            num_new_tokens,
+            reserved_mixture_groups,
+            reserved_branch_rows,
+        ):
+            return token_budget
+
+        new_blocks = self.kv_cache_manager.allocate_slots(
+            request,
+            num_new_tokens,
+            num_new_computed_tokens=num_new_local_computed_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_lookahead_tokens=self.num_lookahead_tokens,
+            has_scheduled_reqs=bool(self.running),
+        )
+        if new_blocks is None:
+            return token_budget
+
+        self._remove_berag_waiting_request(request)
+        self.running.append(request)
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+        if request.status == RequestStatus.WAITING:
+            scheduled_new_reqs.append(request)
+        else:
+            scheduled_resumed_reqs.append(request)
+
+        req_to_new_blocks[request.request_id] = self.kv_cache_manager.get_blocks(
+            request.request_id
+        )
+        num_scheduled_tokens[request.request_id] = num_new_tokens
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = num_computed_tokens
+        if num_computed_tokens + num_new_tokens < request.num_tokens:
+            self._inflight_prefills.add(request)
+        return token_budget - num_new_tokens
+
+    def _make_scheduler_output_from_parts(
+        self,
+        *,
+        scheduled_new_reqs: list[Request],
+        scheduled_resumed_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+        preempted_reqs: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        num_scheduled_tokens: dict[str, int],
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+        scheduled_encoder_inputs: dict[str, list[int]],
+        scheduled_berag_shards: list[ScheduledBeragShard] | None,
+    ) -> SchedulerOutput:
+        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
+        with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
+            if self.running:
+                any_request_id = self.running[0].request_id
+                num_common_prefix_blocks = (
+                    self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
+                )
+
+        if self.use_v2_model_runner:
+            scheduled_new_reqs.extend(scheduled_resumed_reqs)
+            scheduled_resumed_reqs.clear()
+            new_reqs_data = [
+                NewRequestData.from_request(
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    req._all_token_ids,
+                )
+                for req in scheduled_new_reqs
+            ]
+        else:
+            new_reqs_data = [
+                NewRequestData.from_request(
+                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                )
+                for req in scheduled_new_reqs
+            ]
+
+        with record_function_or_nullcontext("schedule: make_cached_request_data"):
+            cached_reqs_data = self._make_cached_request_data(
+                scheduled_running_reqs,
+                scheduled_resumed_reqs,
+                num_scheduled_tokens,
+                scheduled_spec_decode_tokens,
+                req_to_new_blocks,
+            )
+
+        if not self.use_v2_model_runner:
+            self.prev_step_scheduled_req_ids.clear()
+            self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+
+        new_block_ids_to_zero = (
+            (self.kv_cache_manager.take_new_block_ids() or None)
+            if self.needs_kv_cache_zeroing
+            else None
+        )
+        num_spec_tokens_to_schedule = self.num_spec_tokens
+        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                len(num_scheduled_tokens)
+            ]
+
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=new_reqs_data,
+            scheduled_cached_reqs=cached_reqs_data,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_encoder_inputs=scheduled_encoder_inputs,
+            num_common_prefix_blocks=num_common_prefix_blocks,
+            preempted_req_ids={req.request_id for req in preempted_reqs},
+            finished_req_ids=self.finished_req_ids,
+            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            new_block_ids_to_zero=new_block_ids_to_zero,
+            num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            scheduled_berag_shards=scheduled_berag_shards,
+            berag_release_rows=self._take_berag_release_rows(),
+            berag_committed_tokens=self._take_berag_committed_tokens(),
+        )
+        if self.connector is not None:
+            scheduler_output.kv_connector_metadata = self._build_kv_connector_meta(
+                self.connector, scheduler_output
+            )
+        if self.ec_connector is not None:
+            scheduler_output.ec_connector_metadata = (
+                self.ec_connector.build_connector_meta(scheduler_output)
+            )
+        if self.defer_block_free and total_num_scheduled_tokens > 0:
+            self.sched_step_seq += 1
+        with record_function_or_nullcontext("schedule: update_after_schedule"):
+            self._update_after_schedule(scheduler_output)
+        return scheduler_output
+
+    @staticmethod
+    def _berag_progress_error(reasons: dict[str, str]) -> RuntimeError:
+        details = "; ".join(
+            f"{group_id}: {reason}" for group_id, reason in reasons.items()
+        )
+        return RuntimeError(
+            "No BERAG shard can be scheduled. BERAG needs at least one branch "
+            "chunk or one deferred finalize shard to fit the current sequence, "
+            "token, KV-cache, encoder, and accumulator-row budgets. Increase "
+            "max_num_seqs, max_num_batched_tokens, max_num_encoder_input_tokens, "
+            "or num_accumulator_rows; reduce K/document length; or enable "
+            "chunked prefill for this workload. "
+            f"Blocked groups: {details}."
+        )
+
+    def _schedule_berag(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        del throttle_prefills
+        scheduled_new_reqs: list[Request] = []
+        scheduled_resumed_reqs: list[Request] = []
+        scheduled_running_reqs: list[Request] = []
+        preempted_reqs: list[Request] = []
+        req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        num_scheduled_tokens: dict[str, int] = {}
+        scheduled_encoder_inputs: dict[str, list[int]] = {}
+        encoder_compute_budget = self.max_num_encoder_input_tokens
+        scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        token_budget = self.max_num_scheduled_tokens
+        if self._pause_state == PauseState.PAUSED_ALL:
+            token_budget = 0
+
+        scheduled_timestamp = time.monotonic()
+        self.kv_cache_manager.new_step_starts()
+        scheduled_berag_shards = self._collect_ready_berag_finalizes()
+        virtual_running_reqs = len(self.running)
+        blocked_berag_groups: dict[str, str] = {}
+
+        if self._pause_state != PauseState.PAUSED_ALL:
+            for group in self._berag_ordered_groups_for_work():
+                if token_budget <= 0:
+                    blocked_berag_groups[group.group_id] = (
+                        "token budget is exhausted"
+                    )
+                    break
+                pending_branch_ids = sorted(
+                    group.active_branch_ids - group.completed_branch_ids
+                )
+                if not pending_branch_ids:
+                    continue
+                candidate_plans: list[BeragBranchSchedulePlan] = []
+                candidate_budget = token_budget
+                candidate_running_reqs = virtual_running_reqs
+                for branch_id in pending_branch_ids:
+                    if candidate_budget <= 0:
+                        break
+                    req_id = group.child_request_ids[branch_id]
+                    request = self.requests.get(req_id)
+                    if request is None or request.is_finished():
+                        continue
+                    plan = self._plan_berag_branch_request(
+                        request, candidate_budget, candidate_running_reqs
+                    )
+                    if plan is None:
+                        continue
+                    candidate_plans.append(plan)
+                    candidate_budget -= plan.num_new_tokens
+                    if plan.was_waiting:
+                        candidate_running_reqs += 1
+
+                if not candidate_plans:
+                    blocked_berag_groups[group.group_id] = (
+                        "no branch could be planned within the current token/"
+                        "sequence/KV budget"
+                    )
+                    continue
+
+                direct_mix_candidate = self._berag_direct_mix_candidate(
+                    group, candidate_plans
+                )
+                while candidate_plans and not direct_mix_candidate:
+                    rows_needed = self._berag_rows_needed_for_plans(
+                        group, candidate_plans
+                    )
+                    if rows_needed <= self.berag_row_allocator.free_count:
+                        break
+                    dropped = candidate_plans.pop()
+                    self._berag_debug(
+                        group,
+                        "row backpressure dropped branch=%d rows_needed=%d "
+                        "free=%d remaining_branches=%s",
+                        dropped.branch_id,
+                        rows_needed,
+                        self.berag_row_allocator.free_count,
+                        [plan.branch_id for plan in candidate_plans],
+                    )
+                    direct_mix_candidate = self._berag_direct_mix_candidate(
+                        group, candidate_plans
+                    )
+
+                if not candidate_plans:
+                    blocked_berag_groups[group.group_id] = (
+                        "accumulator row budget cannot fit any "
+                        "evidence-producing branch in this shard"
+                    )
+                    continue
+
+                if not direct_mix_candidate:
+                    rows_needed = self._berag_rows_needed_for_plans(
+                        group, candidate_plans
+                    )
+                    if rows_needed > self.berag_row_allocator.free_count:
+                        blocked_berag_groups[group.group_id] = (
+                            f"accumulator path needs {rows_needed} rows but "
+                            f"only {self.berag_row_allocator.free_count} "
+                            "are free"
+                        )
+                        continue
+
+                committed_plans: list[BeragBranchSchedulePlan] = []
+                for plan in candidate_plans:
+                    if token_budget < plan.num_new_tokens:
+                        blocked_berag_groups[group.group_id] = (
+                            "token budget was exhausted before committing all "
+                            "planned branches"
+                        )
+                        break
+                    if plan.was_waiting and virtual_running_reqs >= (
+                        self.max_num_running_reqs
+                    ):
+                        blocked_berag_groups[group.group_id] = (
+                            "sequence budget was exhausted before committing "
+                            "all planned branches"
+                        )
+                        break
+                    committed, encoder_compute_budget = (
+                        self._commit_berag_branch_plan(
+                            plan,
+                            scheduled_timestamp,
+                            scheduled_new_reqs,
+                            scheduled_resumed_reqs,
+                            scheduled_running_reqs,
+                            req_to_new_blocks,
+                            num_scheduled_tokens,
+                            scheduled_encoder_inputs,
+                            encoder_compute_budget,
+                        )
+                    )
+                    if not committed:
+                        blocked_berag_groups[group.group_id] = (
+                            "KV cache or encoder scheduling rejected branch "
+                            f"{plan.branch_id}"
+                        )
+                        break
+                    committed_plans.append(plan)
+                    token_budget -= plan.num_new_tokens
+                    if plan.was_waiting:
+                        virtual_running_reqs += 1
+
+                if not committed_plans:
+                    continue
+                shard = self._make_berag_shard_from_committed_plans(
+                    group, committed_plans
+                )
+                if shard is None:
+                    raise RuntimeError(
+                        "BERAG row reservation invariant violated after KV "
+                        f"allocation: group={group.group_id}, "
+                        f"branches={[p.branch_id for p in committed_plans]}, "
+                        f"free_rows={self.berag_row_allocator.free_count}."
+                    )
+                scheduled_berag_shards.append(shard)
+                blocked_berag_groups.pop(group.group_id, None)
+
+        if (
+            self._pause_state != PauseState.PAUSED_ALL
+            and not num_scheduled_tokens
+            and not scheduled_berag_shards
+            and blocked_berag_groups
+        ):
+            raise self._berag_progress_error(blocked_berag_groups)
+
+        assert sum(num_scheduled_tokens.values()) <= self.max_num_scheduled_tokens
+        assert token_budget >= 0
+        assert len(self.running) <= self.max_num_running_reqs
+
+        return self._make_scheduler_output_from_parts(
+            scheduled_new_reqs=scheduled_new_reqs,
+            scheduled_resumed_reqs=scheduled_resumed_reqs,
+            scheduled_running_reqs=scheduled_running_reqs,
+            preempted_reqs=preempted_reqs,
+            req_to_new_blocks=req_to_new_blocks,
+            num_scheduled_tokens=num_scheduled_tokens,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_encoder_inputs=scheduled_encoder_inputs,
+            scheduled_berag_shards=scheduled_berag_shards or None,
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
-        if berag_finalize := self._find_ready_berag_finalize():
-            output = self._make_empty_scheduler_output(
-                scheduled_berag_shards=[berag_finalize]
-            )
-            self.finished_req_ids = set()
-            return output
+        if self.berag_groups:
+            return self._schedule_berag(throttle_prefills)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1296,6 +2285,7 @@ class Scheduler(SchedulerInterface):
 
             if not self._try_reserve_berag_rows(
                 request,
+                request.num_computed_tokens,
                 num_new_tokens,
                 berag_reserved_mixture_groups,
                 berag_reserved_branch_rows,
@@ -1632,6 +2622,7 @@ class Scheduler(SchedulerInterface):
 
                 if not self._try_reserve_berag_rows(
                     request,
+                    num_computed_tokens,
                     num_new_tokens,
                     berag_reserved_mixture_groups,
                     berag_reserved_branch_rows,
@@ -2813,6 +3804,7 @@ class Scheduler(SchedulerInterface):
                 pruning_top_p=meta.pruning_top_p,
             )
             self.berag_groups[meta.group_id] = group
+            self.berag_group_order.append(meta.group_id)
         group.register_child(request)
         if self.berag_config.prior_mode == "uniform":
             group.prior_scores[meta.branch_id] = 0.0
@@ -2840,6 +3832,10 @@ class Scheduler(SchedulerInterface):
             return
         self._release_berag_step_rows(group)
         self.berag_groups.pop(meta.group_id, None)
+        try:
+            self.berag_group_order.remove(meta.group_id)
+        except ValueError:
+            pass
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus

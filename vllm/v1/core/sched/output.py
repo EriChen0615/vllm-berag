@@ -185,17 +185,34 @@ class CachedRequestData:
 class ScheduledBeragShard:
     group_id: str
     step_id: int
-    req_ids: list[str]
-    branch_ids: list[int]
     mixture_row_id: int
-    branch_row_ids: list[int]
+    scheduled_req_ids: list[str]
+    scheduled_branch_ids: list[int]
+    prior_req_ids: list[str]
+    prior_branch_ids: list[int]
+    prior_token_indices: list[int]
+    evidence_branch_ids: list[int]
+    evidence_row_ids: list[int]
+    mix_req_ids: list[str]
+    mix_branch_ids: list[int]
+    mix_row_ids: list[int]
     log_posterior: list[float]
     is_final_shard: bool
+    direct_mix: bool = False
     sample_on_completion: bool = True
-    scheduled_branch_ids: list[int] | None = None
-    prior_req_ids: list[str] | None = None
-    prior_token_indices: list[int] | None = None
     debug: bool = False
+
+    @property
+    def req_ids(self) -> list[str]:
+        return self.scheduled_req_ids or self.mix_req_ids
+
+    @property
+    def branch_ids(self) -> list[int]:
+        return self.mix_branch_ids or self.evidence_branch_ids
+
+    @property
+    def branch_row_ids(self) -> list[int]:
+        return self.mix_row_ids or self.evidence_row_ids
 
 
 @dataclass

@@ -13,6 +13,7 @@ from my_scripts.narrativeqa_benchmark_utils import (
     build_nested_chunk_ids,
     build_prediction_row,
     make_longbench_prompt,
+    make_narrativeqa_prompt,
     make_standard_rag_context,
     read_jsonl,
     render_qwen_chat_prompt,
@@ -59,16 +60,26 @@ def test_nested_chunk_ids_keep_gold_in_first_50_and_preserve_prefixes():
 
 
 class FakeTokenizer:
+    def __init__(self) -> None:
+        self.last_messages = None
+
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
         assert not tokenize
         assert add_generation_prompt
+        self.last_messages = messages
         assert messages[0]["role"] == "system"
         assert messages[1]["role"] == "user"
+        user_content = messages[1]["content"]
+        if isinstance(user_content, list):
+            user_content = "".join(
+                "<image>" if item["type"] == "image" else item["text"]
+                for item in user_content
+            )
         return (
             "<|im_start|>system\n"
             f"{messages[0]['content']}<|im_end|>\n"
             "<|im_start|>user\n"
-            f"{messages[1]['content']}<|im_end|>\n"
+            f"{user_content}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
 
@@ -84,6 +95,28 @@ def test_prompt_rendering_uses_qwen_chat_template_and_longbench_prompt():
     assert "[Chunk 2]\nbeta" in rendered
     assert "Question: Who wins?" in rendered
     assert rendered.endswith("<|im_start|>assistant\n")
+
+
+def test_image_prompt_rendering_adds_image_block_and_response_format():
+    tokenizer = FakeTokenizer()
+    context = make_standard_rag_context(["alpha"])
+    user_prompt = make_narrativeqa_prompt(
+        context,
+        "Who wins?",
+        include_image=True,
+    )
+
+    rendered = render_qwen_chat_prompt(
+        tokenizer,
+        user_prompt,
+        include_image=True,
+    )
+
+    assert tokenizer.last_messages[1]["content"][0] == {"type": "image"}
+    assert tokenizer.last_messages[1]["content"][1]["type"] == "text"
+    assert "First, describe the image" in rendered
+    assert "Image:" in rendered
+    assert "Answer:" in rendered
 
 
 class FakeCompletion:
