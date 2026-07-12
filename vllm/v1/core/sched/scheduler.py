@@ -978,6 +978,52 @@ class Scheduler(SchedulerInterface):
         )
         return {key: value - denom for key, value in log_values.items()}
 
+    def _berag_final_info(self, group: BeragGroupState) -> dict[str, Any]:
+        branch_ids = list(range(group.num_branches))
+        prior_values = {
+            branch_id: group.prior_scores[branch_id]
+            for branch_id in branch_ids
+            if branch_id in group.prior_scores
+        }
+        log_prior = self._normalize_logs(prior_values) if prior_values else {}
+        log_posterior = {
+            branch_id: group.log_posterior[branch_id]
+            for branch_id in branch_ids
+            if branch_id in group.log_posterior
+        }
+
+        def aligned_values(log_values: dict[int, float]) -> list[float | None]:
+            return [
+                float(log_values[branch_id]) if branch_id in log_values else None
+                for branch_id in branch_ids
+            ]
+
+        def sorted_branch_ids(log_values: dict[int, float]) -> list[int]:
+            return sorted(
+                log_values,
+                key=lambda branch_id: (-log_values[branch_id], branch_id),
+            )
+
+        prior_sorted = sorted_branch_ids(log_prior)
+        posterior_sorted = sorted_branch_ids(log_posterior)
+        active_branch_ids = sorted(group.active_branch_ids)
+        active_set = set(active_branch_ids)
+        return {
+            "num_branches": group.num_branches,
+            "log_prior_by_branch": aligned_values(log_prior),
+            "log_posterior_by_branch": aligned_values(log_posterior),
+            "prior_max_branch_id": prior_sorted[0] if prior_sorted else None,
+            "posterior_max_branch_id": (
+                posterior_sorted[0] if posterior_sorted else None
+            ),
+            "prior_sorted_branch_ids": prior_sorted,
+            "posterior_sorted_branch_ids": posterior_sorted,
+            "active_branch_ids": active_branch_ids,
+            "pruned_branch_ids": [
+                branch_id for branch_id in branch_ids if branch_id not in active_set
+            ],
+        }
+
     def _ensure_berag_posterior(self, group: BeragGroupState) -> None:
         if group.log_posterior:
             return
@@ -1232,6 +1278,9 @@ class Scheduler(SchedulerInterface):
                         stop_reason=representative.stop_reason,
                         events=self._take_berag_parent_events(group),
                         trace_headers=representative.trace_headers,
+                        berag_info=(
+                            self._berag_final_info(group) if stopped else None
+                        ),
                     )
                 )
         return stopped_running

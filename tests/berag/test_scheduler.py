@@ -174,6 +174,7 @@ def make_berag_model_output(
     prior_scores: dict[int, float] | None = None,
     sampled_token_id: int | None = None,
     sampled_token_logprobs: dict[int, float] | None = None,
+    step_id: int = 0,
     free_rows: int = 400,
     live_rows: int = 0,
 ) -> ModelRunnerOutput:
@@ -185,7 +186,7 @@ def make_berag_model_output(
         berag_outputs=[
             BeragModelRunnerOutput(
                 group_id=parent_id,
-                step_id=0,
+                step_id=step_id,
                 completed_branch_ids=completed_branch_ids,
                 prior_scores=prior_scores,
                 sampled_token_id=sampled_token_id,
@@ -821,6 +822,101 @@ def test_berag_direct_shard_commits_parent_output_without_rows(tmp_path):
     assert parent_outputs[0].new_token_ids == [42]
     assert scheduler.berag_row_allocator.free_count == 400
     assert scheduler.berag_committed_tokens
+
+
+def test_berag_final_output_includes_prior_posterior_info(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path, max_num_seqs=2, max_num_batched_tokens=4
+    )
+    for request in [
+        make_berag_child_request(
+            0, num_branches=2, max_tokens=1, pruning_top_p=1.0
+        ),
+        make_berag_child_request(
+            1, num_branches=2, max_tokens=1, pruning_top_p=1.0
+        ),
+    ]:
+        scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        make_berag_model_output(
+            completed_branch_ids=[0, 1],
+            prior_scores={0: 0.0, 1: -1.0},
+            sampled_token_id=42,
+            sampled_token_logprobs={0: -2.0, 1: -0.1},
+        ),
+    )
+
+    parent_output = outputs[0].outputs[0]
+    info = parent_output.berag_info
+    assert parent_output.finish_reason is not None
+    assert info is not None
+    expected_prior = Scheduler._normalize_logs({0: 0.0, 1: -1.0})
+    expected_posterior = Scheduler._normalize_logs(
+        {0: expected_prior[0] - 2.0, 1: expected_prior[1] - 0.1}
+    )
+    assert info["num_branches"] == 2
+    assert info["log_prior_by_branch"] == pytest.approx(
+        [expected_prior[0], expected_prior[1]]
+    )
+    assert info["log_posterior_by_branch"] == pytest.approx(
+        [expected_posterior[0], expected_posterior[1]]
+    )
+    assert info["prior_max_branch_id"] == 0
+    assert info["posterior_max_branch_id"] == 1
+    assert info["prior_sorted_branch_ids"] == [0, 1]
+    assert info["posterior_sorted_branch_ids"] == [1, 0]
+    assert info["active_branch_ids"] == [0, 1]
+    assert info["pruned_branch_ids"] == []
+
+
+def test_berag_final_output_marks_pruned_posterior_as_none(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path, max_num_seqs=2, max_num_batched_tokens=4
+    )
+    for request in [
+        make_berag_child_request(
+            0, num_branches=2, max_tokens=2, pruning_top_p=0.8
+        ),
+        make_berag_child_request(
+            1, num_branches=2, max_tokens=2, pruning_top_p=0.8
+        ),
+    ]:
+        scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduler_output,
+        make_berag_model_output(
+            completed_branch_ids=[0, 1],
+            prior_scores={0: 0.0, 1: 0.0},
+            sampled_token_id=42,
+            sampled_token_logprobs={0: -0.1, 1: -10.0},
+        ),
+    )
+    assert scheduler.berag_groups["parent"].active_branch_ids == {0}
+
+    decode_output = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        decode_output,
+        make_berag_model_output(
+            completed_branch_ids=[0],
+            sampled_token_id=43,
+            sampled_token_logprobs={0: -0.2},
+            step_id=1,
+        ),
+    )
+
+    info = outputs[0].outputs[0].berag_info
+    assert info is not None
+    assert info["log_prior_by_branch"] == pytest.approx([-math.log(2), -math.log(2)])
+    assert info["log_posterior_by_branch"] == [0.0, None]
+    assert info["posterior_max_branch_id"] == 0
+    assert info["posterior_sorted_branch_ids"] == [0]
+    assert info["active_branch_ids"] == [0]
+    assert info["pruned_branch_ids"] == [1]
 
 
 def test_berag_final_shard_updates_posterior_and_prunes_branch(tmp_path):

@@ -1454,6 +1454,22 @@ class GPUModelRunner(
                         log_weights = (
                             prior_tensor - torch.logsumexp(prior_tensor, dim=0)
                         ).to(torch.bfloat16).view(-1, 1)
+                    if shard.debug:
+                        self._berag_debug_shard(
+                            shard,
+                            "sampling mixture weights branches=%s "
+                            "raw_prior_scores=%s shard_log_posterior=%s "
+                            "log_weights=%s direct_mix=%s",
+                            shard.mix_branch_ids,
+                            {
+                                branch_id: prior_scores.get(branch_id)
+                                for branch_id in shard.mix_branch_ids
+                                if branch_id in prior_scores
+                            },
+                            shard.log_posterior,
+                            log_weights.view(-1).float().cpu().tolist(),
+                            shard.direct_mix,
+                        )
                     mixture = torch.logsumexp(
                         branch_logprobs + log_weights, dim=0
                     ).to(torch.bfloat16)
@@ -1487,6 +1503,22 @@ class GPUModelRunner(
                         dtype=torch.bfloat16,
                         device=self.device,
                     ).view(-1, 1)
+                    if shard.debug:
+                        self._berag_debug_shard(
+                            shard,
+                            "sampling mixture weights branches=%s "
+                            "raw_prior_scores=%s shard_log_posterior=%s "
+                            "log_weights=%s direct_mix=%s",
+                            shard.mix_branch_ids,
+                            {
+                                branch_id: prior_scores.get(branch_id)
+                                for branch_id in shard.mix_branch_ids
+                                if branch_id in prior_scores
+                            },
+                            shard.log_posterior,
+                            log_weights.view(-1).float().cpu().tolist(),
+                            shard.direct_mix,
+                        )
                     mixture = torch.logsumexp(branch_rows + log_weights, dim=0).to(
                         torch.bfloat16
                     )
