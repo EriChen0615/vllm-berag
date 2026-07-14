@@ -73,6 +73,7 @@ def create_local_scheduler(
     block_size: int = 16,
     num_blocks: int = 10000,
     berag_prior_mode: str = "module",
+    enable_prefix_caching: bool = False,
     berag_group_trace_path: str | None = None,
     berag_group_trace_full_posterior: bool = False,
 ) -> Scheduler:
@@ -96,7 +97,7 @@ def create_local_scheduler(
         block_size=block_size,
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
-        enable_prefix_caching=False,
+        enable_prefix_caching=enable_prefix_caching,
     )
     vllm_config = VllmConfig(
         model_config=model_config,
@@ -142,15 +143,21 @@ def make_berag_child_request(
     parent_id: str = "parent",
     num_branches: int = 3,
     prompt_len: int = 2,
+    prompt_token_ids: list[int] | None = None,
     max_tokens: int = 4,
     pruning_top_p: float = 0.8,
+    prior_token_index: int = 0,
     mm_features: list[MultiModalFeatureSpec] | None = None,
 ) -> Request:
     init_none_hash(sha256)
     sampling_params = SamplingParams(max_tokens=max_tokens)
     return Request(
         request_id=f"{parent_id}:berag:{branch_id}",
-        prompt_token_ids=[branch_id] * prompt_len,
+        prompt_token_ids=(
+            prompt_token_ids
+            if prompt_token_ids is not None
+            else [branch_id] * prompt_len
+        ),
         sampling_params=sampling_params,
         pooling_params=None,
         mm_features=mm_features,
@@ -161,7 +168,7 @@ def make_berag_child_request(
             branch_id=branch_id,
             num_branches=num_branches,
             parent_prompt_len=1,
-            prior_token_index=0,
+            prior_token_index=prior_token_index,
             pruning_top_p=pruning_top_p,
         ),
     )
@@ -198,6 +205,16 @@ def make_berag_model_output(
             free_rows=free_rows,
             live_rows=live_rows,
         ),
+    )
+
+
+def berag_row_pool_for_scheduler(scheduler: Scheduler) -> BeragRowPoolTelemetry:
+    total_rows = scheduler.berag_config.num_accumulator_rows
+    free_rows = scheduler.berag_row_allocator.free_count
+    return BeragRowPoolTelemetry(
+        total_rows=total_rows,
+        free_rows=free_rows,
+        live_rows=total_rows - free_rows,
     )
 
 
@@ -1066,3 +1083,107 @@ def test_berag_scheduler_ignores_stale_step_outputs(tmp_path):
     group = scheduler.berag_groups["parent"]
     assert group.prior_scores == {}
     assert group.completed_branch_ids == set()
+
+
+def test_berag_module_prior_caps_prefix_cache_before_prior_token(
+    tmp_path,
+    monkeypatch,
+):
+    scheduler = create_local_scheduler(
+        tmp_path,
+        max_num_seqs=2,
+        max_num_batched_tokens=128,
+        berag_prior_mode="module",
+        enable_prefix_caching=True,
+    )
+    prompt_token_ids = [index // 16 for index in range(64)]
+    cache_hit_caps: list[int | None] = []
+
+    def fake_get_computed_blocks(
+        request: Request,
+        *,
+        max_cache_hit_length: int | None = None,
+    ):
+        del request
+        cache_hit_caps.append(max_cache_hit_length)
+        return scheduler.kv_cache_manager.empty_kv_cache_blocks, 32
+
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager,
+        "get_computed_blocks",
+        fake_get_computed_blocks,
+    )
+
+    scheduler.add_request(
+        make_berag_child_request(
+            0,
+            num_branches=1,
+            prompt_token_ids=prompt_token_ids,
+            max_tokens=1,
+            prior_token_index=40,
+            pruning_top_p=1.0,
+        )
+    )
+
+    scheduler_output = scheduler.schedule()
+    shard = scheduler_output.scheduled_berag_shards[0]
+
+    assert cache_hit_caps == [40]
+    assert scheduler_output.num_scheduled_tokens == {"parent:berag:0": 32}
+    assert shard.prior_req_ids == ["parent:berag:0"]
+    assert shard.prior_branch_ids == [0]
+    assert shard.evidence_branch_ids == [0]
+    assert shard.is_final_shard
+    assert shard.direct_mix
+    assert shard.sample_on_completion
+
+
+def test_berag_scheduler_raises_when_finalize_waits_on_missing_priors(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path,
+        max_num_seqs=8,
+        max_num_batched_tokens=8,
+        berag_prior_mode="module",
+    )
+    for branch_id in range(5):
+        scheduler.add_request(
+            make_berag_child_request(
+                branch_id,
+                num_branches=5,
+                prompt_len=2,
+                max_tokens=1,
+                pruning_top_p=1.0,
+            )
+        )
+
+    def update_without_priors() -> None:
+        scheduler_output = scheduler.schedule()
+        shard = scheduler_output.scheduled_berag_shards[0]
+        scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=shard.scheduled_req_ids,
+                req_id_to_index={
+                    req_id: index
+                    for index, req_id in enumerate(shard.scheduled_req_ids)
+                },
+                sampled_token_ids=[],
+                berag_outputs=[
+                    BeragModelRunnerOutput(
+                        group_id=shard.group_id,
+                        step_id=shard.step_id,
+                        completed_branch_ids=shard.evidence_branch_ids,
+                        prior_scores=None,
+                        sampled_token_id=None,
+                        sampled_token_logprobs=None,
+                    )
+                ],
+                berag_row_pool=berag_row_pool_for_scheduler(scheduler),
+            ),
+        )
+
+    update_without_priors()
+    update_without_priors()
+
+    with pytest.raises(RuntimeError, match="missing_prior_branches"):
+        scheduler.schedule()

@@ -221,6 +221,40 @@ def make_kv_cache_config_three_types(
     )
 
 
+def test_get_computed_blocks_respects_max_cache_hit_length():
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 8),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    prompt_token_ids = [index // block_size for index in range(64)]
+
+    req0 = make_request("0", prompt_token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    blocks = manager.allocate_slots(
+        req0,
+        len(prompt_token_ids),
+        num_computed_tokens,
+        computed_blocks,
+    )
+    assert blocks is not None
+
+    req1 = make_request("1", prompt_token_ids, block_size, sha256)
+    _, uncapped_tokens = manager.get_computed_blocks(req1)
+    capped_blocks, capped_tokens = manager.get_computed_blocks(
+        req1,
+        max_cache_hit_length=40,
+    )
+
+    assert uncapped_tokens == 48
+    assert capped_tokens == 32
+    assert capped_tokens <= 40
+    assert len(capped_blocks.blocks[0]) == 2
+
+
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_prefill(hash_fn):
     block_size = 16

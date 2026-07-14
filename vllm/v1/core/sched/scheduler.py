@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from vllm.berag import BeragChildMetadata
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -1339,6 +1340,54 @@ class Scheduler(SchedulerInterface):
                     groups.append(group)
         return groups
 
+    def _berag_prior_cache_hit_cap(
+        self,
+        group: BeragGroupState,
+        meta: BeragChildMetadata,
+    ) -> int | None:
+        if self.berag_config.prior_mode != "module":
+            return None
+        if meta.branch_id in group.prior_scores:
+            return None
+        return meta.prior_token_index
+
+    def _berag_stalled_group_reasons(self) -> dict[str, str]:
+        reasons: dict[str, str] = {}
+        for group_id in list(self.berag_group_order):
+            group = self.berag_groups.get(group_id)
+            if group is None or not group.all_children_registered:
+                continue
+            has_rows = group.mixture_row_id is not None or bool(group.branch_row_ids)
+            if not has_rows and not group.pending_finalize:
+                continue
+            if (
+                group.pending_finalize
+                and group.priors_ready
+                and group.step_evidence_ready
+                and group.mixture_row_id is not None
+            ):
+                continue
+            missing_priors = sorted(
+                group.active_branch_ids - set(group.prior_scores)
+            )
+            missing_evidence = sorted(
+                group.active_branch_ids - group.completed_branch_ids
+            )
+            row_ids = list(group.branch_row_ids.values())
+            if group.mixture_row_id is not None:
+                row_ids.append(group.mixture_row_id)
+            state = (
+                "pending finalize is blocked"
+                if group.pending_finalize
+                else "owns accumulator rows but cannot schedule more work"
+            )
+            reasons[group_id] = (
+                f"{state}; missing_prior_branches={missing_priors}, "
+                f"missing_evidence_branches={missing_evidence}, "
+                f"row_ids={row_ids}, step_id={group.step_id}"
+            )
+        return reasons
+
     def _remove_berag_waiting_request(self, request: Request) -> None:
         for queue in (self.waiting, self.skipped_waiting):
             if any(queued is request for queued in queue):
@@ -1386,8 +1435,13 @@ class Scheduler(SchedulerInterface):
             return None
 
         if request.num_computed_tokens == 0:
+            group = self.berag_groups[meta.group_id]
+            max_cache_hit_length = self._berag_prior_cache_hit_cap(group, meta)
             new_computed_blocks, num_new_local_computed_tokens = (
-                self.kv_cache_manager.get_computed_blocks(request)
+                self.kv_cache_manager.get_computed_blocks(
+                    request,
+                    max_cache_hit_length=max_cache_hit_length,
+                )
             )
             num_computed_tokens = num_new_local_computed_tokens
         else:
@@ -2170,9 +2224,11 @@ class Scheduler(SchedulerInterface):
             self._pause_state != PauseState.PAUSED_ALL
             and not num_scheduled_tokens
             and not scheduled_berag_shards
-            and blocked_berag_groups
         ):
-            raise self._berag_progress_error(blocked_berag_groups)
+            stalled_berag_groups = self._berag_stalled_group_reasons()
+            blocked_berag_groups.update(stalled_berag_groups)
+            if blocked_berag_groups:
+                raise self._berag_progress_error(blocked_berag_groups)
 
         assert sum(num_scheduled_tokens.values()) <= self.max_num_scheduled_tokens
         assert token_budget >= 0
