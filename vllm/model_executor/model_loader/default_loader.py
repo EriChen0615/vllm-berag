@@ -208,7 +208,8 @@ class DefaultModelLoader(BaseModelLoader):
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
-            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            weights_pattern = os.path.join(glob.escape(hf_folder), pattern)
+            hf_weights_files += glob.glob(weights_pattern)
             if len(hf_weights_files) > 0:
                 if pattern.endswith(".safetensors"):
                     use_safetensors = True

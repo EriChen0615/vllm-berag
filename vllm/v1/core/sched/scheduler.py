@@ -63,6 +63,7 @@ from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreOutput,
     EngineCoreOutputs,
+    FinishReason,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -979,7 +980,11 @@ class Scheduler(SchedulerInterface):
         )
         return {key: value - denom for key, value in log_values.items()}
 
-    def _berag_final_info(self, group: BeragGroupState) -> dict[str, Any]:
+    def _berag_final_info(
+        self,
+        group: BeragGroupState,
+        log_posterior_override: dict[int, float] | None = None,
+    ) -> dict[str, Any]:
         branch_ids = list(range(group.num_branches))
         prior_values = {
             branch_id: group.prior_scores[branch_id]
@@ -987,10 +992,15 @@ class Scheduler(SchedulerInterface):
             if branch_id in group.prior_scores
         }
         log_prior = self._normalize_logs(prior_values) if prior_values else {}
+        posterior_source = (
+            group.log_posterior
+            if log_posterior_override is None
+            else log_posterior_override
+        )
         log_posterior = {
-            branch_id: group.log_posterior[branch_id]
+            branch_id: posterior_source[branch_id]
             for branch_id in branch_ids
-            if branch_id in group.log_posterior
+            if branch_id in posterior_source
         }
 
         def aligned_values(log_values: dict[int, float]) -> list[float | None]:
@@ -1137,6 +1147,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             self._ensure_berag_posterior(group)
+            log_posterior_before_token = dict(group.log_posterior)
             if berag_output.sampled_token_logprobs:
                 updated = {
                     branch_id: group.log_posterior[branch_id]
@@ -1280,7 +1291,16 @@ class Scheduler(SchedulerInterface):
                         events=self._take_berag_parent_events(group),
                         trace_headers=representative.trace_headers,
                         berag_info=(
-                            self._berag_final_info(group) if stopped else None
+                            self._berag_final_info(
+                                group,
+                                log_posterior_override=(
+                                    log_posterior_before_token
+                                    if finish_reason == FinishReason.STOP
+                                    else None
+                                ),
+                            )
+                            if stopped
+                            else None
                         ),
                     )
                 )

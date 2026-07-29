@@ -29,6 +29,7 @@ from vllm.v1.core.sched.scheduler import (
     Scheduler,
 )
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -145,12 +146,16 @@ def make_berag_child_request(
     prompt_len: int = 2,
     prompt_token_ids: list[int] | None = None,
     max_tokens: int = 4,
+    stop_token_ids: list[int] | None = None,
     pruning_top_p: float = 0.8,
     prior_token_index: int = 0,
     mm_features: list[MultiModalFeatureSpec] | None = None,
 ) -> Request:
     init_none_hash(sha256)
-    sampling_params = SamplingParams(max_tokens=max_tokens)
+    sampling_params = SamplingParams(
+        max_tokens=max_tokens,
+        stop_token_ids=stop_token_ids,
+    )
     return Request(
         request_id=f"{parent_id}:berag:{branch_id}",
         prompt_token_ids=(
@@ -841,7 +846,7 @@ def test_berag_direct_shard_commits_parent_output_without_rows(tmp_path):
     assert scheduler.berag_committed_tokens
 
 
-def test_berag_final_output_includes_prior_posterior_info(tmp_path):
+def test_berag_length_output_includes_final_token_in_posterior(tmp_path):
     scheduler = create_local_scheduler(
         tmp_path, max_num_seqs=2, max_num_batched_tokens=4
     )
@@ -868,7 +873,7 @@ def test_berag_final_output_includes_prior_posterior_info(tmp_path):
 
     parent_output = outputs[0].outputs[0]
     info = parent_output.berag_info
-    assert parent_output.finish_reason is not None
+    assert parent_output.finish_reason == FinishReason.LENGTH
     assert info is not None
     expected_prior = Scheduler._normalize_logs({0: 0.0, 1: -1.0})
     expected_posterior = Scheduler._normalize_logs(
@@ -887,6 +892,62 @@ def test_berag_final_output_includes_prior_posterior_info(tmp_path):
     assert info["posterior_sorted_branch_ids"] == [1, 0]
     assert info["active_branch_ids"] == [0, 1]
     assert info["pruned_branch_ids"] == []
+
+
+def test_berag_stop_output_excludes_stop_token_from_posterior(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path, max_num_seqs=2, max_num_batched_tokens=4
+    )
+    for request in [
+        make_berag_child_request(
+            0,
+            num_branches=2,
+            max_tokens=4,
+            stop_token_ids=[43],
+            pruning_top_p=1.0,
+        ),
+        make_berag_child_request(
+            1,
+            num_branches=2,
+            max_tokens=4,
+            stop_token_ids=[43],
+            pruning_top_p=1.0,
+        ),
+    ]:
+        scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduler_output,
+        make_berag_model_output(
+            completed_branch_ids=[0, 1],
+            prior_scores={0: 0.0, 1: 0.0},
+            sampled_token_id=42,
+            sampled_token_logprobs={0: -0.1, 1: -2.0},
+        ),
+    )
+    expected_posterior = Scheduler._normalize_logs({0: -0.1, 1: -2.0})
+
+    decode_output = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        decode_output,
+        make_berag_model_output(
+            completed_branch_ids=[0, 1],
+            sampled_token_id=43,
+            sampled_token_logprobs={0: -4.0, 1: -0.1},
+            step_id=1,
+        ),
+    )
+
+    parent_output = outputs[0].outputs[0]
+    info = parent_output.berag_info
+    assert parent_output.finish_reason == FinishReason.STOP
+    assert info is not None
+    assert info["log_posterior_by_branch"] == pytest.approx(
+        [expected_posterior[0], expected_posterior[1]]
+    )
+    assert info["posterior_max_branch_id"] == 0
+    assert info["posterior_sorted_branch_ids"] == [0, 1]
 
 
 def test_berag_final_output_marks_pruned_posterior_as_none(tmp_path):
