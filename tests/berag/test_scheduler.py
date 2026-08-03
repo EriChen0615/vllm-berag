@@ -476,7 +476,7 @@ def test_berag_shard_has_explicit_group_scoped_fields(tmp_path):
     assert shard.direct_mix
 
 
-def test_berag_scheduler_uses_leftover_capacity_for_partial_group(tmp_path):
+def test_berag_scheduler_does_not_partially_admit_fresh_group(tmp_path):
     scheduler = create_local_scheduler(
         tmp_path,
         max_num_seqs=12,
@@ -498,29 +498,138 @@ def test_berag_scheduler_uses_leftover_capacity_for_partial_group(tmp_path):
 
     scheduler_output = scheduler.schedule()
 
-    assert len(scheduler_output.scheduled_berag_shards) == 3
+    assert len(scheduler_output.scheduled_berag_shards) == 2
     assert set(scheduler_output.num_scheduled_tokens) == {
         f"parent-{parent_index}:berag:{branch_id}"
-        for parent_index, branch_count in ((0, 5), (1, 5), (2, 2))
-        for branch_id in range(branch_count)
+        for parent_index in range(2)
+        for branch_id in range(5)
     }
-    for shard in scheduler_output.scheduled_berag_shards[:2]:
+    for shard in scheduler_output.scheduled_berag_shards:
         assert shard.direct_mix
         assert shard.scheduled_branch_ids == [0, 1, 2, 3, 4]
         assert shard.evidence_row_ids == []
         assert shard.mix_row_ids == []
-    partial_shard = scheduler_output.scheduled_berag_shards[2]
-    assert partial_shard.group_id == "parent-2"
-    assert not partial_shard.direct_mix
-    assert partial_shard.scheduled_branch_ids == [0, 1]
-    assert partial_shard.evidence_branch_ids == [0, 1]
-    assert partial_shard.mixture_row_id >= 0
-    assert len(partial_shard.evidence_row_ids) == 2
-    assert not partial_shard.is_final_shard
-    assert not partial_shard.sample_on_completion
+    assert scheduler.berag_groups["parent-0"].admitted
+    assert scheduler.berag_groups["parent-1"].admitted
+    assert not scheduler.berag_groups["parent-2"].admitted
 
 
-def test_berag_partial_scheduler_uses_available_sequence_budget(tmp_path):
+def test_berag_scheduler_reserves_kv_for_complete_group(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path,
+        max_num_seqs=6,
+        max_num_batched_tokens=32,
+        num_blocks=7,
+        berag_prior_mode="uniform",
+    )
+    for parent_id in ("parent-a", "parent-b"):
+        for branch_id in range(3):
+            scheduler.add_request(
+                make_berag_child_request(
+                    branch_id,
+                    parent_id=parent_id,
+                    num_branches=3,
+                    prompt_len=17,
+                    max_tokens=1,
+                    pruning_top_p=1.0,
+                )
+            )
+
+    scheduler_output = scheduler.schedule()
+
+    assert scheduler.berag_groups["parent-a"].admitted
+    assert not scheduler.berag_groups["parent-b"].admitted
+    assert scheduler_output.scheduled_berag_shards
+    assert all(
+        shard.group_id == "parent-a"
+        for shard in scheduler_output.scheduled_berag_shards
+    )
+    assert not any(
+        req_id.startswith("parent-b:")
+        for req_id in scheduler_output.num_scheduled_tokens
+    )
+
+
+def test_berag_scheduler_shares_and_seeds_common_prefix(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path,
+        max_num_seqs=3,
+        max_num_batched_tokens=32,
+        num_blocks=5,
+        berag_prior_mode="uniform",
+        enable_prefix_caching=True,
+    )
+    common_prefix = [7] * 16
+    for branch_id in range(3):
+        scheduler.add_request(
+            make_berag_child_request(
+                branch_id,
+                num_branches=3,
+                prompt_token_ids=common_prefix + [8 + branch_id],
+                max_tokens=1,
+                pruning_top_p=1.0,
+            )
+        )
+
+    group = scheduler.berag_groups["parent"]
+    reservation = scheduler._berag_group_reservation(group)
+
+    assert reservation.kv_blocks == 4
+
+    scheduler_output = scheduler.schedule()
+
+    assert group.admitted
+    assert scheduler_output.num_scheduled_tokens == {
+        "parent:berag:0": 16,
+    }
+
+
+def test_berag_top_p_releases_capacity_for_next_group(tmp_path):
+    scheduler = create_local_scheduler(
+        tmp_path,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        berag_prior_mode="uniform",
+    )
+    for parent_id in ("parent-a", "parent-b"):
+        for branch_id in range(3):
+            scheduler.add_request(
+                make_berag_child_request(
+                    branch_id,
+                    parent_id=parent_id,
+                    num_branches=3,
+                    prompt_len=1,
+                    max_tokens=4,
+                    pruning_top_p=0.8,
+                )
+            )
+
+    first_output = scheduler.schedule()
+
+    assert scheduler.berag_groups["parent-a"].admitted
+    assert not scheduler.berag_groups["parent-b"].admitted
+    scheduler.update_from_output(
+        first_output,
+        make_berag_model_output(
+            parent_id="parent-a",
+            completed_branch_ids=[0, 1, 2],
+            sampled_token_id=42,
+            sampled_token_logprobs={0: -0.1, 1: -10.0, 2: -10.0},
+        ),
+    )
+
+    assert scheduler.berag_groups["parent-a"].active_branch_ids == {0}
+
+    second_output = scheduler.schedule()
+
+    assert scheduler.berag_groups["parent-b"].admitted
+    assert any(
+        shard.group_id == "parent-b"
+        for shard in second_output.scheduled_berag_shards
+    )
+
+
+def test_berag_scheduler_rejects_group_larger_than_sequence_budget(tmp_path):
     scheduler = create_local_scheduler(
         tmp_path,
         max_num_seqs=2,
@@ -537,18 +646,11 @@ def test_berag_partial_scheduler_uses_available_sequence_budget(tmp_path):
             )
         )
 
-    scheduler_output = scheduler.schedule()
-
-    assert len(scheduler_output.scheduled_berag_shards) == 1
-    shard = scheduler_output.scheduled_berag_shards[0]
-    assert not shard.direct_mix
-    assert shard.scheduled_branch_ids == [0, 1]
-    assert shard.evidence_branch_ids == [0, 1]
-    assert shard.mixture_row_id >= 0
-    assert len(shard.evidence_row_ids) == 2
-    assert not shard.is_final_shard
-    assert not shard.sample_on_completion
-    assert "parent:berag:2" not in scheduler_output.num_scheduled_tokens
+    with pytest.raises(
+        RuntimeError,
+        match="requires 3 sequence slots but max_num_seqs=2",
+    ):
+        scheduler.schedule()
 
 
 def test_berag_chunk_without_evidence_is_scheduled_as_partial_work(tmp_path):
@@ -680,7 +782,7 @@ def test_berag_scheduler_prefers_in_progress_partial_group(tmp_path):
     assert "parent-b:berag:0" not in first_output.num_scheduled_tokens
 
 
-def test_berag_k50_partial_shard_does_not_require_complete_group(tmp_path):
+def test_berag_k50_admitted_group_can_compute_in_partial_shards(tmp_path):
     scheduler = create_local_scheduler(
         tmp_path,
         max_num_seqs=256,
@@ -712,12 +814,13 @@ def test_berag_k50_partial_shard_does_not_require_complete_group(tmp_path):
     assert len(shard.evidence_row_ids) == evidence_branch_count
     assert not shard.is_final_shard
     assert not shard.sample_on_completion
+    assert scheduler.berag_groups["parent"].admitted
 
 
 def test_berag_scheduler_raises_when_no_partial_shard_can_fit_rows(tmp_path):
     scheduler = create_local_scheduler(
         tmp_path,
-        max_num_seqs=2,
+        max_num_seqs=3,
         max_num_batched_tokens=32,
         berag_prior_mode="uniform",
     )
@@ -732,7 +835,10 @@ def test_berag_scheduler_raises_when_no_partial_shard_can_fit_rows(tmp_path):
             )
         )
 
-    with pytest.raises(RuntimeError, match="No BERAG shard can be scheduled"):
+    with pytest.raises(
+        RuntimeError,
+        match="requires 4 accumulator rows but only 1",
+    ):
         scheduler.schedule()
 
 
@@ -1164,8 +1270,9 @@ def test_berag_module_prior_caps_prefix_cache_before_prior_token(
         request: Request,
         *,
         max_cache_hit_length: int | None = None,
+        record_stats: bool = True,
     ):
-        del request
+        del request, record_stats
         cache_hit_caps.append(max_cache_hit_length)
         return scheduler.kv_cache_manager.empty_kv_cache_blocks, 32
 
@@ -1189,7 +1296,7 @@ def test_berag_module_prior_caps_prefix_cache_before_prior_token(
     scheduler_output = scheduler.schedule()
     shard = scheduler_output.scheduled_berag_shards[0]
 
-    assert cache_hit_caps == [40]
+    assert cache_hit_caps == [40, 40]
     assert scheduler_output.num_scheduled_tokens == {"parent:berag:0": 32}
     assert shard.prior_req_ids == ["parent:berag:0"]
     assert shard.prior_branch_ids == [0]

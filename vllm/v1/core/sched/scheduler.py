@@ -98,6 +98,14 @@ class BeragRowAllocator:
             self.free_rows.append(row)
 
 
+@dataclass(frozen=True)
+class BeragGroupReservation:
+    sequence_slots: int
+    kv_blocks: int
+    encoder_embeds: int
+    accumulator_rows: int
+
+
 @dataclass
 class BeragGroupState:
     group_id: str
@@ -116,6 +124,8 @@ class BeragGroupState:
     branch_row_ids: dict[int, int] = field(default_factory=dict)
     pending_finalize: bool = False
     step_started: bool = False
+    admitted: bool = False
+    reservation: BeragGroupReservation | None = None
     parent_queued_ts: float | None = None
     first_scheduled_ts: float | None = None
     parent_events_emitted: bool = False
@@ -1360,6 +1370,309 @@ class Scheduler(SchedulerInterface):
                     groups.append(group)
         return groups
 
+    def _berag_active_requests(self, group: BeragGroupState) -> list[Request]:
+        requests: list[Request] = []
+        for branch_id in sorted(group.active_branch_ids):
+            request = self.requests.get(group.child_request_ids[branch_id])
+            if request is not None and not request.is_finished():
+                requests.append(request)
+        return requests
+
+    def _berag_group_common_prefix_tokens(
+        self, group: BeragGroupState
+    ) -> int:
+        """Cache-aligned token prefix shared by every active branch."""
+        active_requests = self._berag_active_requests(group)
+        if len(active_requests) < 2 or not self.cache_config.enable_prefix_caching:
+            return 0
+
+        first_token_ids = active_requests[0].prompt_token_ids
+        if first_token_ids is None:
+            return 0
+        common_prefix_tokens = len(first_token_ids)
+        for request in active_requests[1:]:
+            token_ids = request.prompt_token_ids
+            if token_ids is None:
+                return 0
+            common_prefix_tokens = min(common_prefix_tokens, len(token_ids))
+            index = 0
+            while (
+                index < common_prefix_tokens
+                and first_token_ids[index] == token_ids[index]
+            ):
+                index += 1
+            common_prefix_tokens = index
+            if common_prefix_tokens == 0:
+                return 0
+
+        for request in active_requests:
+            meta = request.berag_child
+            assert meta is not None
+            cache_hit_cap = self._berag_prior_cache_hit_cap(group, meta)
+            if cache_hit_cap is not None:
+                common_prefix_tokens = min(
+                    common_prefix_tokens, cache_hit_cap
+                )
+        return (
+            common_prefix_tokens // self.block_size * self.block_size
+        )
+
+    def _berag_group_prefix_seed(
+        self, group: BeragGroupState
+    ) -> tuple[int | None, int]:
+        """Return the sole branch that should materialize a missing prefix."""
+        common_prefix_tokens = self._berag_group_common_prefix_tokens(group)
+        if common_prefix_tokens == 0:
+            return None, 0
+
+        active_requests = self._berag_active_requests(group)
+        if any(
+            request.num_computed_tokens >= common_prefix_tokens
+            for request in active_requests
+        ):
+            return None, common_prefix_tokens
+
+        seed_request = active_requests[0]
+        if seed_request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            meta = seed_request.berag_child
+            assert meta is not None
+            cache_hit_cap = self._berag_prior_cache_hit_cap(group, meta)
+            _, cached_tokens = self.kv_cache_manager.get_computed_blocks(
+                seed_request,
+                max_cache_hit_length=(
+                    min(common_prefix_tokens, cache_hit_cap)
+                    if cache_hit_cap is not None
+                    else common_prefix_tokens
+                ),
+                record_stats=False,
+            )
+            if cached_tokens >= common_prefix_tokens:
+                return None, common_prefix_tokens
+
+        seed_meta = seed_request.berag_child
+        assert seed_meta is not None
+        return seed_meta.branch_id, common_prefix_tokens
+
+    def _berag_request_completion_blocks(self, request: Request) -> int:
+        """KV blocks still needed to carry a branch through max generation."""
+        new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+        num_new_local_computed_tokens = 0
+        if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            meta = request.berag_child
+            assert meta is not None
+            group = self.berag_groups[meta.group_id]
+            max_cache_hit_length = self._berag_prior_cache_hit_cap(group, meta)
+            new_computed_blocks, num_new_local_computed_tokens = (
+                self.kv_cache_manager.get_computed_blocks(
+                    request,
+                    max_cache_hit_length=max_cache_hit_length,
+                    record_stats=False,
+                )
+            )
+
+        target_tokens = min(
+            request.num_prompt_tokens + request.max_tokens,
+            self.max_model_len,
+        )
+        total_computed_tokens = (
+            request.num_computed_tokens + num_new_local_computed_tokens
+        )
+        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=target_tokens,
+            new_computed_blocks=new_computed_blocks.blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=total_computed_tokens,
+            num_tokens_main_model=target_tokens,
+            apply_admission_cap=True,
+        )
+
+    def _berag_group_encoder_embeds(
+        self,
+        group: BeragGroupState,
+        *,
+        include_referenced_cache: bool = False,
+    ) -> int:
+        """Encoder-cache capacity a group still needs, deduplicated by input."""
+        unique_inputs: dict[str, int] = {}
+        for request in self._berag_active_requests(group):
+            cached_input_ids = self.encoder_cache_manager.get_cached_input_ids(request)
+            for input_id, feature in enumerate(request.mm_features):
+                if input_id in cached_input_ids:
+                    continue
+                mm_hash = feature.identifier
+                references = self.encoder_cache_manager.cached.get(mm_hash)
+                if references and not include_referenced_cache:
+                    continue
+                unique_inputs[mm_hash] = max(
+                    unique_inputs.get(mm_hash, 0),
+                    request.get_num_encoder_embeds(input_id),
+                )
+        return sum(unique_inputs.values())
+
+    def _berag_group_reservation(
+        self, group: BeragGroupState
+    ) -> BeragGroupReservation:
+        active_requests = self._berag_active_requests(group)
+        sequence_slots = sum(
+            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            for request in active_requests
+        )
+        completion_blocks = [
+            self._berag_request_completion_blocks(request)
+            for request in active_requests
+        ]
+        kv_blocks = sum(completion_blocks)
+        if not group.admitted and len(active_requests) > 1:
+            common_prefix_tokens = self._berag_group_common_prefix_tokens(group)
+            shared_prefix_blocks = (
+                self.kv_cache_manager.get_num_shareable_prefix_blocks(
+                    common_prefix_tokens
+                )
+            )
+            kv_blocks = max(
+                kv_blocks
+                - shared_prefix_blocks * (len(active_requests) - 1),
+                0,
+            )
+        live_rows = len(group.branch_row_ids) + (
+            1 if group.mixture_row_id is not None else 0
+        )
+        accumulator_rows = max(len(active_requests) + 1 - live_rows, 0)
+        return BeragGroupReservation(
+            sequence_slots=sequence_slots,
+            kv_blocks=kv_blocks,
+            encoder_embeds=self._berag_group_encoder_embeds(group),
+            accumulator_rows=accumulator_rows,
+        )
+
+    def _refresh_berag_group_reservation(
+        self, group: BeragGroupState
+    ) -> BeragGroupReservation:
+        group.reservation = self._berag_group_reservation(group)
+        return group.reservation
+
+    def _berag_reserved_resources(
+        self, *, exclude_group_id: str | None = None
+    ) -> BeragGroupReservation:
+        reservations: list[BeragGroupReservation] = []
+        for group in self.berag_groups.values():
+            if not group.admitted or group.group_id == exclude_group_id:
+                continue
+            reservation = group.reservation
+            if reservation is None:
+                reservation = self._refresh_berag_group_reservation(group)
+            reservations.append(reservation)
+        return BeragGroupReservation(
+            sequence_slots=sum(item.sequence_slots for item in reservations),
+            kv_blocks=sum(item.kv_blocks for item in reservations),
+            encoder_embeds=sum(item.encoder_embeds for item in reservations),
+            accumulator_rows=sum(item.accumulator_rows for item in reservations),
+        )
+
+    def _berag_permanent_admission_error(
+        self,
+        group: BeragGroupState,
+        reservation: BeragGroupReservation,
+    ) -> str | None:
+        active_count = len(self._berag_active_requests(group))
+        if active_count > self.max_num_running_reqs:
+            return (
+                f"group requires {active_count} sequence slots but max_num_seqs="
+                f"{self.max_num_running_reqs}"
+            )
+        required_rows = active_count + 1
+        if required_rows > self.berag_row_allocator.num_rows:
+            return (
+                f"group requires {required_rows} accumulator rows but only "
+                f"{self.berag_row_allocator.num_rows} are configured"
+            )
+        total_kv_blocks = self.kv_cache_manager.kv_cache_config.num_blocks
+        if reservation.kv_blocks > total_kv_blocks:
+            return (
+                f"group requires at least {reservation.kv_blocks} KV blocks to "
+                f"finish but the cache has {total_kv_blocks}"
+            )
+        full_encoder_embeds = self._berag_group_encoder_embeds(
+            group, include_referenced_cache=True
+        )
+        if full_encoder_embeds > self.encoder_cache_manager.cache_size:
+            return (
+                f"group requires {full_encoder_embeds} encoder-cache slots but "
+                f"the cache has {self.encoder_cache_manager.cache_size}"
+            )
+        return None
+
+    def _try_admit_berag_group(
+        self, group: BeragGroupState
+    ) -> tuple[bool, str | None]:
+        if group.admitted:
+            if group.reservation is None:
+                self._refresh_berag_group_reservation(group)
+            return True, None
+
+        reservation = self._berag_group_reservation(group)
+        permanent_error = self._berag_permanent_admission_error(group, reservation)
+        if permanent_error is not None:
+            raise RuntimeError(
+                f"BERAG group {group.group_id} cannot be admitted atomically: "
+                f"{permanent_error}. Reduce K/document or generation length, or "
+                "increase the corresponding engine capacity."
+            )
+
+        reserved = self._berag_reserved_resources()
+        available = BeragGroupReservation(
+            sequence_slots=max(
+                self.max_num_running_reqs
+                - len(self.running)
+                - reserved.sequence_slots,
+                0,
+            ),
+            kv_blocks=max(
+                self.kv_cache_manager.block_pool.get_num_free_blocks()
+                - reserved.kv_blocks,
+                0,
+            ),
+            encoder_embeds=max(
+                self.encoder_cache_manager.num_freeable_slots
+                - reserved.encoder_embeds,
+                0,
+            ),
+            accumulator_rows=max(
+                self.berag_row_allocator.free_count - reserved.accumulator_rows,
+                0,
+            ),
+        )
+        deficits = [
+            f"sequences={reservation.sequence_slots}/{available.sequence_slots}"
+            if reservation.sequence_slots > available.sequence_slots
+            else None,
+            f"kv_blocks={reservation.kv_blocks}/{available.kv_blocks}"
+            if reservation.kv_blocks > available.kv_blocks
+            else None,
+            f"encoder_embeds={reservation.encoder_embeds}/{available.encoder_embeds}"
+            if reservation.encoder_embeds > available.encoder_embeds
+            else None,
+            f"rows={reservation.accumulator_rows}/{available.accumulator_rows}"
+            if reservation.accumulator_rows > available.accumulator_rows
+            else None,
+        ]
+        deficits = [item for item in deficits if item is not None]
+        if deficits:
+            return False, "atomic group admission is waiting for " + ", ".join(deficits)
+
+        group.admitted = True
+        group.reservation = reservation
+        self._write_berag_group_trace(
+            group,
+            "admit_group",
+            reserved_sequence_slots=reservation.sequence_slots,
+            reserved_kv_blocks=reservation.kv_blocks,
+            reserved_encoder_embeds=reservation.encoder_embeds,
+            reserved_accumulator_rows=reservation.accumulator_rows,
+        )
+        return True, None
+
     def _berag_prior_cache_hit_cap(
         self,
         group: BeragGroupState,
@@ -1503,6 +1816,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int],
         scheduled_encoder_inputs: dict[str, list[int]],
         encoder_compute_budget: int,
+        reserved_kv_blocks: int,
     ) -> tuple[bool, int]:
         request = plan.request
         num_new_tokens = plan.num_new_tokens
@@ -1530,6 +1844,7 @@ class Scheduler(SchedulerInterface):
                 request,
                 num_new_tokens,
                 num_lookahead_tokens=self.num_lookahead_tokens,
+                reserved_blocks=reserved_kv_blocks,
             )
             if new_blocks is None:
                 return False, encoder_compute_budget
@@ -1566,6 +1881,7 @@ class Scheduler(SchedulerInterface):
             num_new_computed_tokens=plan.num_new_local_computed_tokens,
             new_computed_blocks=plan.new_computed_blocks,
             num_lookahead_tokens=self.num_lookahead_tokens,
+            reserved_blocks=reserved_kv_blocks,
             has_scheduled_reqs=has_scheduled_reqs,
         )
         if new_blocks is None:
@@ -2100,6 +2416,9 @@ class Scheduler(SchedulerInterface):
 
         scheduled_timestamp = time.monotonic()
         self.kv_cache_manager.new_step_starts()
+        for group in self.berag_groups.values():
+            if group.admitted:
+                self._refresh_berag_group_reservation(group)
         scheduled_berag_shards = self._collect_ready_berag_finalizes()
         virtual_running_reqs = len(self.running)
         blocked_berag_groups: dict[str, str] = {}
@@ -2111,17 +2430,33 @@ class Scheduler(SchedulerInterface):
                         "token budget is exhausted"
                     )
                     break
+                admitted, admission_reason = self._try_admit_berag_group(group)
+                if not admitted:
+                    assert admission_reason is not None
+                    blocked_berag_groups[group.group_id] = admission_reason
+                    continue
+                reserved_kv_blocks = self._berag_reserved_resources(
+                    exclude_group_id=group.group_id
+                ).kv_blocks
                 pending_branch_ids = sorted(
                     group.active_branch_ids - group.completed_branch_ids
                 )
                 if not pending_branch_ids:
                     continue
+                prefix_seed_branch_id, prefix_seed_tokens = (
+                    self._berag_group_prefix_seed(group)
+                )
                 candidate_plans: list[BeragBranchSchedulePlan] = []
                 candidate_budget = token_budget
                 candidate_running_reqs = virtual_running_reqs
                 for branch_id in pending_branch_ids:
                     if candidate_budget <= 0:
                         break
+                    if (
+                        prefix_seed_branch_id is not None
+                        and branch_id != prefix_seed_branch_id
+                    ):
+                        continue
                     req_id = group.child_request_ids[branch_id]
                     request = self.requests.get(req_id)
                     if request is None or request.is_finished():
@@ -2131,6 +2466,15 @@ class Scheduler(SchedulerInterface):
                     )
                     if plan is None:
                         continue
+                    if prefix_seed_branch_id is not None:
+                        remaining_prefix_tokens = (
+                            prefix_seed_tokens - plan.num_computed_tokens
+                        )
+                        if remaining_prefix_tokens <= 0:
+                            continue
+                        plan.num_new_tokens = min(
+                            plan.num_new_tokens, remaining_prefix_tokens
+                        )
                     candidate_plans.append(plan)
                     candidate_budget -= plan.num_new_tokens
                     if plan.was_waiting:
@@ -2212,6 +2556,7 @@ class Scheduler(SchedulerInterface):
                             num_scheduled_tokens,
                             scheduled_encoder_inputs,
                             encoder_compute_budget,
+                            reserved_kv_blocks,
                         )
                     )
                     if not committed:
@@ -2237,6 +2582,7 @@ class Scheduler(SchedulerInterface):
                         f"branches={[p.branch_id for p in committed_plans]}, "
                         f"free_rows={self.berag_row_allocator.free_count}."
                     )
+                self._refresh_berag_group_reservation(group)
                 scheduled_berag_shards.append(shard)
                 blocked_berag_groups.pop(group.group_id, None)
 

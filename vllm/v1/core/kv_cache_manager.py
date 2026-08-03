@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -199,11 +200,30 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    def get_num_shareable_prefix_blocks(self, num_tokens: int) -> int:
+        """Return physical full-attention blocks shared by identical prefixes."""
+        if not self.enable_caching or num_tokens <= 0:
+            return 0
+
+        aligned_tokens = (
+            num_tokens // self.coordinator.scheduler_block_size
+        ) * self.coordinator.scheduler_block_size
+        total_blocks = 0
+        for manager in self.coordinator.single_type_managers:
+            if not isinstance(manager, FullAttentionManager):
+                continue
+            manager_blocks = aligned_tokens // manager.block_size
+            if self.use_eagle and manager_blocks:
+                manager_blocks = max(manager_blocks - 1, 0)
+            total_blocks += manager_blocks
+        return total_blocks
+
     def get_computed_blocks(
         self,
         request: Request,
         *,
         max_cache_hit_length: int | None = None,
+        record_stats: bool = True,
     ) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -213,6 +233,8 @@ class KVCacheManager:
             max_cache_hit_length: Optional maximum cache hit length. This is
                 used by callers that need hidden states for a token that would
                 otherwise be skipped by prefix caching.
+            record_stats: Whether to include this lookup in prefix-cache
+                statistics.
 
         Returns:
             A tuple containing:
@@ -246,7 +268,7 @@ class KVCacheManager:
             )
         )
 
-        if self.log_stats:
+        if self.log_stats and record_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(
                 num_tokens=request.num_tokens,
